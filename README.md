@@ -55,6 +55,7 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
+- [LibContinual](https://github.com/RL-VIG/LibContinual)
+- [LibFewShot](https://github.com/RL-VIG/LibFewShot)
 
 

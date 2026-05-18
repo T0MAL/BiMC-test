@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
-import models.clip as clip
 from datasets.data_manager import DatasetManager
-from torch.nn import functional as F
 from tqdm import tqdm
 from utils.evaluator import AccuracyEvaluator
+from utils.phase1_fusion import beta_statistics, compute_class_margin_beta, validate_phase1_options
+from utils.phase1_report import write_phase1_outputs
 from models.bimc import BiMC
 import numpy as np
 import time
@@ -14,6 +14,7 @@ class Runner:
 
     def __init__(self, cfg):
         self.cfg = cfg
+        validate_phase1_options(cfg)
         self.data_manager = DatasetManager(cfg,) 
         self.device = cfg.DEVICE.DEVICE_NAME
 
@@ -31,7 +32,16 @@ class Runner:
 
         self.acc_list = []
         self.task_acc_list = []
+        self.eval_results = []
+        self.beta_session_records = []
+        self.beta_class_records = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
+
+
+    def _model_impl(self):
+        if self.is_distributed:
+            return self.model.module
+        return self.model
 
 
     def merge_dicts(self, dict_list):
@@ -85,7 +95,7 @@ class Runner:
 
 
 
-            current_state_dict = self.model.build_task_statistics(current_class_name, loader,
+            current_state_dict = self._model_impl().build_task_statistics(current_class_name, loader,
                                                              class_index=self.data_manager.class_index_in_task[i], 
                                                              calibrate_novel_vision_proto=self.cfg.TRAINER.BiMC.VISION_CALIBRATION,)
 
@@ -101,17 +111,19 @@ class Runner:
             print(f'=> Task [{i}], Acc: {acc["mean_acc"]:.3f}')
             self.acc_list.append(round(acc["mean_acc"], 3))
             self.task_acc_list.append(acc['task_acc'])
+            self.eval_results.append(acc)
 
         print(f'Final acc:{self.acc_list}')
         print('Task-wise acc:')
         for i, task_acc in enumerate(self.task_acc_list):
             print(f'task {i:2d}, acc:{task_acc}')
+        return self._save_phase1_outputs()
     
 
     @torch.no_grad()
     def inference_task_covariance(self, task_id, state_dict):
 
-        beta = self.cfg.DATASET.BETA
+        beta, beta_values, beta_class_records = self._prepare_session_beta(task_id, state_dict)
 
         image_proto = state_dict['image_proto']
         cov_image = state_dict['cov_image']
@@ -126,17 +138,23 @@ class Runner:
         test_loader = self.data_manager.get_dataloader(task_id, source='test', mode='test')
         all_logits = []
         all_targets = []
+        beta_chunks = []
+        if beta_values is not None:
+            beta_chunks.append(beta_values)
 
         for i, batch in enumerate(tqdm(test_loader)):
             data, targets = self.parse_batch(batch)
-            logits = self.model.forward_ours(data, num_accumulated_class, num_base_class,
+            logits, beta_info = self._model_impl().forward_ours(data, num_accumulated_class, num_base_class,
                                                    image_proto, 
                                                    cov_image,
                                                    description_proto,
                                                    description_features, 
                                                    description_targets,
                                                    text_features,
-                                                   beta=beta)
+                                                   beta=beta,
+                                                   return_beta_info=True)
+            if beta_info.get("beta") is not None:
+                beta_chunks.append(beta_info["beta"])
 
             all_logits.append(logits)
             all_targets.append(targets)
@@ -145,8 +163,92 @@ class Runner:
         all_targets = torch.cat(all_targets, dim=0)
 
         eval_acc = self.evaluator.calc_accuracy(all_logits, all_targets, task_id) 
+        beta_record = {"session": int(task_id)}
+        beta_record.update(beta_statistics(beta_chunks))
+        self._assert_beta_range(beta_chunks)
+        eval_acc["beta_stats"] = beta_record
+        self.beta_session_records.append(beta_record)
+        self.beta_class_records.extend(beta_class_records)
         print(f"Test acc mean: {eval_acc['mean_acc']}, task-wise acc: {eval_acc['task_acc']}")
         return eval_acc
+
+
+    def _prepare_session_beta(self, task_id, state_dict):
+        opts = self.cfg.TRAINER.BiMC
+        num_accumulated_class = max(self.data_manager.class_index_in_task[task_id]) + 1
+
+        if opts.FUSION_BETA_MODE == "fixed":
+            beta = float(self.cfg.DATASET.BETA)
+            beta_values = torch.full((num_accumulated_class,), beta)
+            return beta, beta_values, []
+
+        if opts.FUSION_BETA_MODE == "query_reliability":
+            return float(self.cfg.DATASET.BETA), None, []
+
+        text_proto = self._model_impl().calibrated_text_proto(
+            state_dict["text_features"],
+            state_dict["description_proto"],
+        )
+        beta = compute_class_margin_beta(
+            support_features=state_dict["images_features"],
+            support_labels=state_dict["images_targets"],
+            text_proto=text_proto,
+            visual_proto=state_dict["image_proto"],
+            beta_temperature=opts.BETA_TEMPERATURE,
+            beta_clip_min=opts.BETA_CLIP_MIN,
+            beta_clip_max=opts.BETA_CLIP_MAX,
+            default_beta=self.cfg.DATASET.BETA,
+            use_leave_one_out=True,
+        )
+        beta_class_records = [
+            {
+                "session": int(task_id),
+                "class_id": int(class_id),
+                "beta": float(value),
+            }
+            for class_id, value in enumerate(beta.detach().cpu())
+        ]
+        return beta, beta.detach().cpu(), beta_class_records
+
+
+    def _assert_beta_range(self, beta_chunks):
+        tensors = []
+        for chunk in beta_chunks:
+            if chunk is None:
+                continue
+            if isinstance(chunk, torch.Tensor):
+                tensors.append(chunk.detach().reshape(-1).cpu())
+            else:
+                tensors.append(torch.as_tensor(chunk).reshape(-1).cpu())
+        if not tensors:
+            return
+        values = torch.cat(tensors, dim=0)
+        min_beta = self.cfg.TRAINER.BiMC.BETA_CLIP_MIN
+        max_beta = self.cfg.TRAINER.BiMC.BETA_CLIP_MAX
+        if values.min().item() < min_beta - 1e-6 or values.max().item() > max_beta + 1e-6:
+            raise ValueError(f"Beta values outside [{min_beta}, {max_beta}].")
+
+
+    def _save_phase1_outputs(self, comparison_rows=None):
+        if not self.cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT:
+            return {
+                "run_dir": None,
+                "session_metrics": self.eval_results,
+                "beta_session_records": self.beta_session_records,
+                "beta_class_records": self.beta_class_records,
+            }
+        return write_phase1_outputs(
+            cfg=self.cfg,
+            dataset_name=self.data_manager.dataset_name,
+            session_metrics=self.eval_results,
+            beta_session_records=self.beta_session_records,
+            beta_class_records=self.beta_class_records,
+            comparison_rows=comparison_rows,
+            notes=[
+                "Class-wise visual margins use leave-one-out same-class prototypes when at least two support samples exist; singleton classes fall back to the regular visual prototype.",
+                "Query-wise beta is computed per test batch from unlabeled query features only.",
+            ],
+        )
     
 
     def parse_batch(self, batch):

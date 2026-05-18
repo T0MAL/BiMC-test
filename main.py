@@ -1,5 +1,10 @@
 from yacs.config import CfgNode as CN
 from utils.util import set_gpu, set_seed
+from utils.phase1_fusion import (
+    VALID_FUSION_BETA_MODES,
+    VALID_FUSION_GEOMETRIES,
+    VALID_RELIABILITY_MODES,
+)
 import argparse
 
 def print_args(cfg):
@@ -29,6 +34,9 @@ def extend_cfg(cfg):
 
     cfg.METHOD = ''
     cfg.SEED = -1
+    cfg.OUTPUT_DIR = 'results/phase1'
+    cfg.RUN_NAME = ''
+    cfg.PHASE1_TIMESTAMP = ''
 
     # For dataset config
     cfg.DATASET = CN()
@@ -69,6 +77,13 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.GAMMA_BASE = -1.0
     cfg.TRAINER.BiMC.GAMMA_INC = -1.0
     cfg.TRAINER.BiMC.USING_ENSEMBLE = False
+    cfg.TRAINER.BiMC.FUSION_BETA_MODE = 'fixed'
+    cfg.TRAINER.BiMC.FUSION_GEOMETRY = 'linear'
+    cfg.TRAINER.BiMC.BETA_TEMPERATURE = 0.05
+    cfg.TRAINER.BiMC.BETA_CLIP_MIN = 0.05
+    cfg.TRAINER.BiMC.BETA_CLIP_MAX = 0.95
+    cfg.TRAINER.BiMC.RELIABILITY_MODE = 'entropy_margin'
+    cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT = True
 
 
 
@@ -88,12 +103,59 @@ def setup_cfg(dataset_cfg_file, method_cfg_file):
     return cfg
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('true', '1', 'yes', 'y'):
+        return True
+    if value in ('false', '0', 'no', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Expected a boolean value.')
+
+
+def apply_cli_overrides(cfg, args):
+    cfg.defrost()
+    if args.fusion_beta_mode is not None:
+        cfg.TRAINER.BiMC.FUSION_BETA_MODE = args.fusion_beta_mode
+    if args.fusion_geometry is not None:
+        cfg.TRAINER.BiMC.FUSION_GEOMETRY = args.fusion_geometry
+    if args.beta_temperature is not None:
+        cfg.TRAINER.BiMC.BETA_TEMPERATURE = args.beta_temperature
+    if args.beta_clip_min is not None:
+        cfg.TRAINER.BiMC.BETA_CLIP_MIN = args.beta_clip_min
+    if args.beta_clip_max is not None:
+        cfg.TRAINER.BiMC.BETA_CLIP_MAX = args.beta_clip_max
+    if args.reliability_mode is not None:
+        cfg.TRAINER.BiMC.RELIABILITY_MODE = args.reliability_mode
+    if args.save_phase1_report is not None:
+        cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT = args.save_phase1_report
+    if args.output_dir is not None:
+        cfg.OUTPUT_DIR = args.output_dir
+    if args.run_name is not None:
+        cfg.RUN_NAME = args.run_name
+    if args.phase1_timestamp is not None:
+        cfg.PHASE1_TIMESTAMP = args.phase1_timestamp
+    cfg.freeze()
+    return cfg
+
+
 def main():
     # Set up the argument parser
     parser = argparse.ArgumentParser(description="Run the pipeline")
 
     parser.add_argument('--data_cfg', type=str, help="Path to the data configuration file")
     parser.add_argument('--train_cfg', type=str, help="Path to the training configuration file")
+    parser.add_argument('--fusion_beta_mode', type=str, choices=VALID_FUSION_BETA_MODES)
+    parser.add_argument('--fusion_geometry', type=str, choices=VALID_FUSION_GEOMETRIES)
+    parser.add_argument('--beta_temperature', type=float)
+    parser.add_argument('--beta_clip_min', type=float)
+    parser.add_argument('--beta_clip_max', type=float)
+    parser.add_argument('--reliability_mode', type=str, choices=VALID_RELIABILITY_MODES)
+    parser.add_argument('--save_phase1_report', type=str2bool, nargs='?', const=True)
+    parser.add_argument('--output_dir', type=str)
+    parser.add_argument('--run_name', type=str)
+    parser.add_argument('--phase1_timestamp', type=str)
 
     args = parser.parse_args()
 
@@ -101,6 +163,7 @@ def main():
     train_cfg = args.train_cfg
 
     cfg = setup_cfg(data_cfg, train_cfg)
+    cfg = apply_cli_overrides(cfg, args)
 
     # Set the random seed and GPU ID
     set_seed(cfg.SEED)

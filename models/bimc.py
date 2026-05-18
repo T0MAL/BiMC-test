@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import models.clip.clip as clip
 import json
+from utils.phase1_fusion import compute_query_reliability_beta, fuse_prototypes
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -139,6 +140,14 @@ class BiMC(nn.Module):
         updated_protos = (1 - shift_weight) * cur_protos + shift_weight * delta_protos
         updated_protos = F.normalize(updated_protos, dim=-1)
         return updated_protos
+
+
+    def calibrated_text_proto(self, text_features, description_proto):
+        if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION:
+            lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T
+        else:
+            lambda_t = 0.0
+        return (1 - lambda_t) * text_features + lambda_t * description_proto
     
 
     def build_task_statistics(self, class_names, loader,
@@ -211,7 +220,8 @@ class BiMC(nn.Module):
                            description_proto,
                            description_features, description_targets,
                            text_features,
-                           beta):
+                           beta,
+                           return_beta_info=False):
     
         def knn_similarity_scores(queries, support_features, support_labels):
             """
@@ -263,16 +273,50 @@ class BiMC(nn.Module):
         img_feat = self.extract_img_feature(images)
         img_feat = F.normalize(img_feat, dim=-1)
 
-        if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION:
-            lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T
-        else:
-            lambda_t = 0.0
+        text_proto = self.calibrated_text_proto(text_features, description_proto)
+        phase1_opts = self.cfg.TRAINER.BiMC
+        beta_info = {
+            "mode": phase1_opts.FUSION_BETA_MODE,
+            "geometry": phase1_opts.FUSION_GEOMETRY,
+            "beta": None,
+        }
 
-        # Here we compute the classifier after modality calibration. 
-        # Note that image_proto has already been calibrated in the `build_task_statistics` function.
-        fused_proto = beta * ((1 - lambda_t) * text_features + lambda_t * description_proto) + (1 - beta) * image_proto        
-        fused_proto = F.normalize(fused_proto, dim=-1)  
-        logits_proto_fused = img_feat @ fused_proto.t()
+        # Preserve the original BiMC formula exactly for the default baseline.
+        if phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
+            fused_proto = beta * text_proto + (1 - beta) * image_proto
+            fused_proto = F.normalize(fused_proto, dim=-1)
+            logits_proto_fused = img_feat @ fused_proto.t()
+        else:
+            text_proto = F.normalize(text_proto, dim=-1)
+            image_proto = F.normalize(image_proto, dim=-1)
+
+            if phase1_opts.FUSION_BETA_MODE == "query_reliability":
+                beta_x = compute_query_reliability_beta(
+                    img_feat,
+                    text_proto,
+                    image_proto,
+                    reliability_mode=phase1_opts.RELIABILITY_MODE,
+                    beta_clip_min=phase1_opts.BETA_CLIP_MIN,
+                    beta_clip_max=phase1_opts.BETA_CLIP_MAX,
+                )
+                fused_proto = fuse_prototypes(
+                    image_proto.unsqueeze(0),
+                    text_proto.unsqueeze(0),
+                    beta_x.view(-1, 1, 1),
+                    geometry=phase1_opts.FUSION_GEOMETRY,
+                )
+                logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat, fused_proto)
+                beta_info["beta"] = beta_x.detach()
+            else:
+                fused_proto = fuse_prototypes(
+                    image_proto,
+                    text_proto,
+                    beta,
+                    geometry=phase1_opts.FUSION_GEOMETRY,
+                )
+                logits_proto_fused = img_feat @ fused_proto.t()
+                if isinstance(beta, torch.Tensor):
+                    beta_info["beta"] = beta.detach()
         prob_fused_proto = F.softmax(logits_proto_fused, dim=-1)
 
         logits_cov = _cov_forward(img_feat, image_proto, cov_image)
@@ -292,6 +336,8 @@ class BiMC(nn.Module):
 
         prob_fused = torch.cat([base_probs, inc_probs], dim=1)
         logits = prob_fused
+        if return_beta_info:
+            return logits, beta_info
         return logits
 
 

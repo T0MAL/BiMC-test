@@ -33,3 +33,11 @@ TRAINER:
     GAMMA_INC: 5.0
 
     USING_ENSEMBLE: True
+
+    FUSION_BETA_MODE: "fixed"
+    FUSION_GEOMETRY: "linear"
+    BETA_TEMPERATURE: 0.05
+    BETA_CLIP_MIN: 0.05
+    BETA_CLIP_MAX: 0.95
+    RELIABILITY_MODE: "entropy_margin"
+    SAVE_PHASE1_REPORT: True

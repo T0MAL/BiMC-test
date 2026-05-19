@@ -6,6 +6,28 @@ from utils.evaluator import AccuracyEvaluator
 from utils.phase1_fusion import beta_statistics, compute_class_margin_beta, validate_phase1_options
 from utils.phase1_report import write_phase1_outputs
 from utils.phase2_prototypes import validate_phase2_options
+from utils.phase5_space import (
+    diagonal_whitening_fit,
+    estimate_common_direction,
+    full_whitening_fit,
+    lda_shrinkage_fit,
+    validate_phase5_options,
+)
+from utils.phase6_alignment import (
+    apply_label_prior_correction,
+    blackbox_shift_prior,
+    label_prior_stats,
+    ot_text_image_alignment,
+    prediction_frequency_prior,
+    support_aware_text_proto,
+    validate_phase6_options,
+)
+from utils.phase7_separation import (
+    graph_highpass_correction,
+    hubness_safe_repulsion,
+    prototype_repulsion,
+    validate_phase7_options,
+)
 from models.bimc import BiMC
 import numpy as np
 import time
@@ -17,6 +39,9 @@ class Runner:
         self.cfg = cfg
         validate_phase1_options(cfg)
         validate_phase2_options(cfg)
+        validate_phase5_options(cfg)
+        validate_phase6_options(cfg)
+        validate_phase7_options(cfg)
         self.data_manager = DatasetManager(cfg,) 
         self.device = cfg.DEVICE.DEVICE_NAME
 
@@ -38,6 +63,10 @@ class Runner:
         self.beta_session_records = []
         self.beta_class_records = []
         self.phase2_records = []
+        self.phase5_records = []
+        self.phase6_records = []
+        self.phase7_records = []
+        self.label_prior_records = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
 
 
@@ -129,6 +158,13 @@ class Runner:
     def inference_task_covariance(self, task_id, state_dict):
 
         beta, beta_values, beta_class_records = self._prepare_session_beta(task_id, state_dict)
+        state_dict = dict(state_dict)
+        phase6_records = self._apply_phase6_alignment(task_id, state_dict)
+        self.phase6_records.extend(phase6_records)
+        phase5_state, phase5_record = self._prepare_phase5_state(task_id, state_dict)
+        self.phase5_records.append(phase5_record)
+        phase7_state, phase7_record = self._prepare_phase7_state(task_id, state_dict, phase5_state, beta)
+        self.phase7_records.append(phase7_record)
 
         image_proto = state_dict['image_proto']
         cov_image = state_dict['cov_image']
@@ -157,7 +193,9 @@ class Runner:
                                                    description_targets,
                                                    text_features,
                                                    beta=beta,
-                                                   return_beta_info=True)
+                                                   return_beta_info=True,
+                                                   phase5_state=phase5_state,
+                                                   phase7_state=phase7_state)
             if beta_info.get("beta") is not None:
                 beta_chunks.append(beta_info["beta"])
 
@@ -166,6 +204,9 @@ class Runner:
 
         all_logits = torch.cat(all_logits, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
+        all_logits, prior_record = self._apply_phase6_label_prior(task_id, all_logits)
+        if prior_record is not None:
+            self.label_prior_records.append(prior_record)
 
         eval_acc = self.evaluator.calc_accuracy(all_logits, all_targets, task_id) 
         beta_record = {"session": int(task_id)}
@@ -234,6 +275,356 @@ class Runner:
             raise ValueError(f"Beta values outside [{min_beta}, {max_beta}].")
 
 
+    def _apply_phase6_alignment(self, task_id, state_dict):
+        opts = self.cfg.TRAINER.BiMC.PHASE6
+        mode = opts.ALIGNMENT_MODE if opts.ENABLED else "none"
+        if mode in ("none", "label_prior_correction"):
+            return []
+
+        description_features = state_dict["description_features"]
+        description_targets = state_dict["description_targets"].to(description_features.device)
+        image_features = state_dict["images_features"]
+        image_targets = state_dict["images_targets"].to(image_features.device)
+        image_proto = state_dict["image_proto"]
+        old_description_proto = state_dict["description_proto"]
+
+        updated_proto = []
+        records = []
+        for class_id in range(old_description_proto.shape[0]):
+            desc = description_features[description_targets == class_id]
+            support = image_features[image_targets == class_id]
+            fallback_reason = ""
+            if mode == "ot_text_image":
+                if opts.OT_USE_SINKHORN:
+                    proto, _, stats = ot_text_image_alignment(
+                        desc,
+                        support,
+                        eps=opts.OT_EPS,
+                        max_iter=opts.OT_MAX_ITER,
+                        normalize_cost=opts.OT_NORMALIZE_COST,
+                    )
+                else:
+                    support_proto = image_proto[class_id]
+                    proto, _, stats = support_aware_text_proto(
+                        desc,
+                        support_proto,
+                        temp=opts.SUPPORT_AWARE_TEXT_TEMP,
+                        topk=opts.SUPPORT_AWARE_TEXT_TOPK,
+                    )
+                    fallback_reason = "sinkhorn_disabled"
+            elif mode == "support_aware_text":
+                support_proto = image_proto[class_id]
+                proto, _, stats = support_aware_text_proto(
+                    desc,
+                    support_proto,
+                    temp=opts.SUPPORT_AWARE_TEXT_TEMP,
+                    topk=opts.SUPPORT_AWARE_TEXT_TOPK,
+                )
+            else:
+                proto = old_description_proto[class_id]
+                stats = {"fallback_reason": "invalid_alignment_mode"}
+
+            if stats.get("fallback_reason"):
+                proto = old_description_proto[class_id]
+            updated_proto.append(proto.to(device=old_description_proto.device, dtype=old_description_proto.dtype))
+
+            record = {
+                "session": int(task_id),
+                "class_id": int(class_id),
+                "phase6_enabled": bool(opts.ENABLED),
+                "alignment_mode": mode,
+                "num_descriptions": int(desc.shape[0]),
+                "num_support": int(support.shape[0]),
+            }
+            record.update(stats)
+            if fallback_reason:
+                record["fallback_reason"] = fallback_reason
+            records.append(record)
+
+        state_dict["description_proto"] = torch.stack(updated_proto, dim=0)
+        return records
+
+
+    def _prepare_phase5_state(self, task_id, state_dict):
+        opts = self.cfg.TRAINER.BiMC.PHASE5
+        mode = opts.SPACE_TRANSFORM if opts.ENABLED else "none"
+        record = {
+            "session": int(task_id),
+            "phase5_enabled": bool(opts.ENABLED),
+            "space_transform": mode,
+            "apply_to": opts.APPLY_TO,
+            "fallback_reason": "",
+        }
+        state = {"enabled": False}
+        if not opts.ENABLED or mode == "none":
+            return state, record
+
+        try:
+            if mode == "common_direction_removal":
+                prototypes = self._phase5_prototype_source(state_dict)
+                features = self._phase5_feature_source(
+                    state_dict,
+                    opts.CDR_SOURCE if opts.CDR_SOURCE != "prototypes" else "all_seen_features",
+                )
+                direction, stats = estimate_common_direction(
+                    prototypes=prototypes,
+                    features=features,
+                    source=opts.CDR_SOURCE,
+                )
+                state = {
+                    "enabled": not bool(stats.get("fallback_reason")),
+                    "mode": mode,
+                    "apply_to": opts.APPLY_TO,
+                    "direction": direction,
+                    "rho": opts.CDR_RHO,
+                    "fallback_reason": stats.get("fallback_reason", ""),
+                }
+                record.update(stats)
+                record["cdr_rho"] = float(opts.CDR_RHO)
+
+            elif mode == "whitening":
+                features = self._phase5_feature_source(state_dict, opts.WHITENING_SOURCE)
+                transform = (
+                    diagonal_whitening_fit(features, eps=opts.WHITENING_EPS)
+                    if opts.WHITENING_DIAG_ONLY
+                    else full_whitening_fit(features, eps=opts.WHITENING_EPS)
+                )
+                state = {
+                    "enabled": True,
+                    "mode": mode,
+                    "apply_to": opts.APPLY_TO,
+                    "transform": transform,
+                    "fallback_reason": transform["stats"].get("fallback_reason", ""),
+                }
+                record.update(transform["stats"])
+                record["whitening_source"] = opts.WHITENING_SOURCE
+                record["whitening_diag_only"] = bool(opts.WHITENING_DIAG_ONLY)
+
+            elif mode == "lda_shrinkage":
+                if opts.APPLY_TO != "all":
+                    raise ValueError("lda_shrinkage_requires_apply_to_all")
+                base_by_class, support_by_class = self._phase5_lda_sources(state_dict)
+                transform = lda_shrinkage_fit(
+                    base_by_class,
+                    support_features_by_class=support_by_class if opts.LDA_SOURCE == "base_plus_support" else None,
+                    dim=opts.LDA_DIM,
+                    gamma=opts.LDA_GAMMA if opts.LDA_USE_SHRINKAGE else 0.0,
+                    novel_weight=opts.LDA_NOVEL_WEIGHT,
+                )
+                state = {
+                    "enabled": True,
+                    "mode": mode,
+                    "apply_to": opts.APPLY_TO,
+                    "projection": transform,
+                    "fallback_reason": transform["stats"].get("fallback_reason", ""),
+                }
+                record.update(transform["stats"])
+                record["lda_source"] = opts.LDA_SOURCE
+                record["lda_use_shrinkage"] = bool(opts.LDA_USE_SHRINKAGE)
+
+        except (RuntimeError, ValueError, KeyError) as exc:
+            record["fallback_reason"] = str(exc)
+            state = {
+                "enabled": False,
+                "mode": mode,
+                "apply_to": opts.APPLY_TO,
+                "fallback_reason": str(exc),
+            }
+
+        return state, record
+
+
+    def _prepare_phase7_state(self, task_id, state_dict, phase5_state, beta):
+        opts = self.cfg.TRAINER.BiMC.PHASE7
+        mode = opts.SEPARATION_MODE if opts.ENABLED else "none"
+        record = {
+            "session": int(task_id),
+            "phase7_enabled": bool(opts.ENABLED),
+            "separation_mode": mode,
+            "separation_source": opts.REPULSION_SOURCE,
+            "fallback_reason": "",
+        }
+        state = {"enabled": False}
+        if not opts.ENABLED or mode == "none":
+            return state, record
+
+        state = {
+            "enabled": True,
+            "mode": mode,
+            "source": opts.REPULSION_SOURCE,
+            "delta": opts.REPULSION_DELTA,
+            "margin": opts.REPULSION_MARGIN,
+            "topk": opts.REPULSION_TOPK if mode != "graph_highpass" else opts.GRAPH_TOPK,
+            "tau": opts.GRAPH_TAU,
+            "gamma": opts.GRAPH_GAMMA,
+            "normalize_adj": bool(opts.GRAPH_NORMALIZE_ADJ),
+            "fallback_reason": "",
+        }
+
+        try:
+            prototypes = self._phase7_source_prototypes(state_dict, phase5_state, beta, opts.REPULSION_SOURCE)
+            hubness = self._phase7_hubness(state_dict, phase5_state, prototypes)
+            state["hubness"] = hubness
+            if mode == "prototype_repulsion":
+                _, stats = prototype_repulsion(
+                    prototypes,
+                    delta=opts.REPULSION_DELTA,
+                    margin=opts.REPULSION_MARGIN,
+                    topk=opts.REPULSION_TOPK,
+                )
+            elif mode == "graph_highpass":
+                _, stats = graph_highpass_correction(
+                    prototypes,
+                    tau=opts.GRAPH_TAU,
+                    gamma=opts.GRAPH_GAMMA,
+                    topk=opts.GRAPH_TOPK,
+                    normalize_adj=opts.GRAPH_NORMALIZE_ADJ,
+                )
+            elif mode == "hubness_safe_repulsion":
+                _, stats = hubness_safe_repulsion(
+                    prototypes,
+                    hubness=hubness,
+                    delta=opts.REPULSION_DELTA,
+                    topk=opts.REPULSION_TOPK,
+                )
+            else:
+                stats = {"fallback_reason": "invalid_separation_mode"}
+            record.update(stats)
+            state["fallback_reason"] = stats.get("fallback_reason", "")
+            state["enabled"] = not bool(state["fallback_reason"])
+        except (RuntimeError, ValueError, KeyError) as exc:
+            record["fallback_reason"] = str(exc)
+            state["enabled"] = False
+            state["fallback_reason"] = str(exc)
+        return state, record
+
+
+    def _apply_phase6_label_prior(self, task_id, logits):
+        opts = self.cfg.TRAINER.BiMC.PHASE6
+        if not opts.ENABLED:
+            return logits, None
+        if not opts.LABEL_PRIOR_ENABLED and opts.ALIGNMENT_MODE != "label_prior_correction":
+            return logits, None
+
+        probs = logits / logits.sum(dim=1, keepdim=True).clamp_min(opts.LABEL_PRIOR_EPS)
+        mode = opts.LABEL_PRIOR_MODE
+        if mode == "prediction_frequency":
+            prior = prediction_frequency_prior(probs, eps=opts.LABEL_PRIOR_EPS)
+        elif mode == "uniform_smoothing":
+            freq = prediction_frequency_prior(probs, eps=opts.LABEL_PRIOR_EPS)
+            uniform = torch.full_like(freq, 1.0 / max(1, freq.numel()))
+            prior = 0.5 * freq + 0.5 * uniform
+            prior = prior / prior.sum().clamp_min(opts.LABEL_PRIOR_EPS)
+        else:
+            prior = blackbox_shift_prior(
+                probs,
+                max_iter=opts.LABEL_PRIOR_MAX_ITER,
+                eps=opts.LABEL_PRIOR_EPS,
+            )
+
+        scores = torch.log(probs.clamp_min(opts.LABEL_PRIOR_EPS))
+        corrected = apply_label_prior_correction(
+            scores,
+            prior,
+            strength=opts.LABEL_PRIOR_STRENGTH,
+            eps=opts.LABEL_PRIOR_EPS,
+        )
+        record = {
+            "session": int(task_id),
+            "phase6_enabled": bool(opts.ENABLED),
+            "alignment_mode": opts.ALIGNMENT_MODE,
+        }
+        record.update(label_prior_stats(
+            prior,
+            mode=mode,
+            strength=opts.LABEL_PRIOR_STRENGTH,
+            transductive=bool(opts.LABEL_PRIOR_TRANSDUCTIVE),
+            level="session",
+        ))
+        return corrected, record
+
+
+    def _phase5_prototype_source(self, state_dict):
+        text_proto = self._model_impl().calibrated_text_proto(
+            state_dict["text_features"],
+            state_dict["description_proto"],
+        )
+        return torch.cat([state_dict["image_proto"], text_proto], dim=0)
+
+
+    def _phase5_feature_source(self, state_dict, source):
+        features = state_dict["images_features"]
+        labels = state_dict["images_targets"].to(features.device)
+        if source == "base_features":
+            num_base = len(self.data_manager.class_index_in_task[0])
+            mask = labels < num_base
+            selected = features[mask]
+            if selected.numel() == 0:
+                raise ValueError("missing_base_features")
+            return selected
+        if source == "all_seen_features":
+            if features.numel() == 0:
+                raise ValueError("missing_all_seen_features")
+            return features
+        raise ValueError(f"invalid_feature_source:{source}")
+
+
+    def _phase5_lda_sources(self, state_dict):
+        features = state_dict["images_features"]
+        labels = state_dict["images_targets"].to(features.device)
+        num_base = len(self.data_manager.class_index_in_task[0])
+        base_by_class = {}
+        support_by_class = {}
+        for class_id in range(state_dict["image_proto"].shape[0]):
+            class_features = features[labels == class_id]
+            if class_features.numel() == 0:
+                continue
+            if class_id < num_base:
+                base_by_class[class_id] = class_features
+            else:
+                support_by_class[class_id] = class_features
+        if len(base_by_class) < 2:
+            raise ValueError("missing_base_class_features_for_lda")
+        return base_by_class, support_by_class
+
+
+    def _phase7_source_prototypes(self, state_dict, phase5_state, beta, source):
+        text_proto = self._model_impl().calibrated_text_proto(
+            state_dict["text_features"],
+            state_dict["description_proto"],
+        )
+        image_proto = state_dict["image_proto"]
+        if phase5_state and phase5_state.get("enabled") and phase5_state.get("apply_to") in ("prototype_only", "all"):
+            text_proto = self._model_impl().phase5_transform_tensor(text_proto, phase5_state)
+            image_proto = self._model_impl().phase5_transform_tensor(image_proto, phase5_state)
+
+        if source == "text":
+            return text_proto
+        if source == "visual":
+            return image_proto
+
+        if isinstance(beta, torch.Tensor):
+            beta_value = beta.to(device=text_proto.device, dtype=text_proto.dtype)
+            while beta_value.ndim < text_proto.ndim:
+                beta_value = beta_value.unsqueeze(-1)
+        else:
+            beta_value = float(beta)
+        return torch.nn.functional.normalize(beta_value * text_proto + (1 - beta_value) * image_proto, dim=-1)
+
+
+    def _phase7_hubness(self, state_dict, phase5_state, prototypes):
+        features = state_dict["images_features"]
+        if phase5_state and phase5_state.get("enabled") and phase5_state.get("apply_to") in ("query_only", "all"):
+            features = self._model_impl().phase5_transform_tensor(features, phase5_state)
+        if features.shape[-1] != prototypes.shape[-1]:
+            return torch.zeros(prototypes.shape[0], device=prototypes.device, dtype=prototypes.dtype)
+        scores = torch.nn.functional.normalize(features, dim=-1).matmul(
+            torch.nn.functional.normalize(prototypes, dim=-1).t()
+        )
+        winners = scores.argmax(dim=1)
+        return torch.bincount(winners, minlength=prototypes.shape[0]).to(device=prototypes.device, dtype=prototypes.dtype)
+
+
     def _save_phase1_outputs(self, comparison_rows=None):
         if not self.cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT:
             return {
@@ -242,6 +633,10 @@ class Runner:
                 "beta_session_records": self.beta_session_records,
                 "beta_class_records": self.beta_class_records,
                 "phase2_records": self.phase2_records,
+                "phase5_records": self.phase5_records,
+                "phase6_records": self.phase6_records,
+                "phase7_records": self.phase7_records,
+                "label_prior_records": self.label_prior_records,
             }
         summary = write_phase1_outputs(
             cfg=self.cfg,
@@ -256,6 +651,10 @@ class Runner:
             ],
         )
         summary["phase2_records"] = self.phase2_records
+        summary["phase5_records"] = self.phase5_records
+        summary["phase6_records"] = self.phase6_records
+        summary["phase7_records"] = self.phase7_records
+        summary["label_prior_records"] = self.label_prior_records
         return summary
     
 

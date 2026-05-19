@@ -15,6 +15,17 @@ from utils.phase2_prototypes import (
     shrinkage_visual_prototype,
     visual_grounded_description_reweight,
 )
+from utils.phase5_space import (
+    common_direction_removal,
+    diagonal_whitening_apply,
+    full_whitening_apply,
+    lda_apply,
+)
+from utils.phase7_separation import (
+    graph_highpass_correction,
+    hubness_safe_repulsion,
+    prototype_repulsion,
+)
 
 
 def _as_float(value):
@@ -540,13 +551,86 @@ class BiMC(nn.Module):
 
    
 
+    def phase5_transform_tensor(self, x, phase5_state):
+        if not phase5_state or not phase5_state.get("enabled", False):
+            return x
+
+        mode = phase5_state.get("mode", "none")
+        try:
+            if mode == "common_direction_removal":
+                return common_direction_removal(
+                    x,
+                    phase5_state["direction"],
+                    rho=phase5_state.get("rho", 0.5),
+                )
+            if mode == "whitening":
+                transform = phase5_state["transform"]
+                if transform.get("type") == "full_whitening":
+                    return full_whitening_apply(x, transform)
+                return diagonal_whitening_apply(x, transform)
+            if mode == "lda_shrinkage":
+                return lda_apply(x, phase5_state["projection"])
+        except (RuntimeError, ValueError, KeyError):
+            return x
+        return x
+
+
+    def phase7_transform_prototypes(self, prototypes, phase7_state):
+        if not phase7_state or not phase7_state.get("enabled", False):
+            return prototypes
+        if phase7_state.get("fallback_reason"):
+            return prototypes
+
+        if prototypes.ndim == 3:
+            return torch.stack(
+                [self.phase7_transform_prototypes(item, phase7_state) for item in prototypes],
+                dim=0,
+            )
+
+        mode = phase7_state.get("mode", "none")
+        try:
+            if mode == "prototype_repulsion":
+                updated, _ = prototype_repulsion(
+                    prototypes,
+                    delta=phase7_state.get("delta", 0.03),
+                    margin=phase7_state.get("margin", 0.0),
+                    topk=phase7_state.get("topk", 5),
+                )
+                return updated
+            if mode == "graph_highpass":
+                updated, _ = graph_highpass_correction(
+                    prototypes,
+                    tau=phase7_state.get("tau", 0.05),
+                    gamma=phase7_state.get("gamma", 0.03),
+                    topk=phase7_state.get("topk", 5),
+                    normalize_adj=phase7_state.get("normalize_adj", True),
+                )
+                return updated
+            if mode == "hubness_safe_repulsion":
+                hubness = phase7_state.get("hubness")
+                if hubness is None:
+                    return prototypes
+                updated, _ = hubness_safe_repulsion(
+                    prototypes,
+                    hubness=hubness,
+                    delta=phase7_state.get("delta", 0.03),
+                    topk=phase7_state.get("topk", 5),
+                )
+                return updated
+        except (RuntimeError, ValueError, KeyError):
+            return prototypes
+        return prototypes
+
+
     def forward_ours(self, images, num_cls, num_base_cls,
                            image_proto, cov_image,
                            description_proto,
                            description_features, description_targets,
                            text_features,
                            beta,
-                           return_beta_info=False):
+                           return_beta_info=False,
+                           phase5_state=None,
+                           phase7_state=None):
     
         def knn_similarity_scores(queries, support_features, support_labels):
             """
@@ -599,6 +683,25 @@ class BiMC(nn.Module):
         img_feat = F.normalize(img_feat, dim=-1)
 
         text_proto = self.calibrated_text_proto(text_features, description_proto)
+        img_feat_for_proto = img_feat
+        text_proto_for_fusion = text_proto
+        image_proto_for_fusion = image_proto
+
+        if phase5_state and phase5_state.get("enabled", False):
+            apply_to = phase5_state.get("apply_to", "all")
+            if apply_to in ("query_only", "all"):
+                img_feat_for_proto = self.phase5_transform_tensor(img_feat_for_proto, phase5_state)
+            if apply_to in ("prototype_only", "all"):
+                text_proto_for_fusion = self.phase5_transform_tensor(text_proto_for_fusion, phase5_state)
+                image_proto_for_fusion = self.phase5_transform_tensor(image_proto_for_fusion, phase5_state)
+
+        if phase7_state and phase7_state.get("enabled", False):
+            source = phase7_state.get("source", "mixed")
+            if source == "text":
+                text_proto_for_fusion = self.phase7_transform_prototypes(text_proto_for_fusion, phase7_state)
+            elif source == "visual":
+                image_proto_for_fusion = self.phase7_transform_prototypes(image_proto_for_fusion, phase7_state)
+
         phase1_opts = self.cfg.TRAINER.BiMC
         beta_info = {
             "mode": phase1_opts.FUSION_BETA_MODE,
@@ -608,38 +711,44 @@ class BiMC(nn.Module):
 
         # Preserve the original BiMC formula exactly for the default baseline.
         if phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
-            fused_proto = beta * text_proto + (1 - beta) * image_proto
+            fused_proto = beta * text_proto_for_fusion + (1 - beta) * image_proto_for_fusion
             fused_proto = F.normalize(fused_proto, dim=-1)
-            logits_proto_fused = img_feat @ fused_proto.t()
+            if phase7_state and phase7_state.get("enabled", False) and phase7_state.get("source", "mixed") == "mixed":
+                fused_proto = self.phase7_transform_prototypes(fused_proto, phase7_state)
+            logits_proto_fused = img_feat_for_proto @ fused_proto.t()
         else:
-            text_proto = F.normalize(text_proto, dim=-1)
-            image_proto = F.normalize(image_proto, dim=-1)
+            text_proto_for_fusion = F.normalize(text_proto_for_fusion, dim=-1)
+            image_proto_for_fusion = F.normalize(image_proto_for_fusion, dim=-1)
 
             if phase1_opts.FUSION_BETA_MODE == "query_reliability":
                 beta_x = compute_query_reliability_beta(
-                    img_feat,
-                    text_proto,
-                    image_proto,
+                    img_feat_for_proto,
+                    text_proto_for_fusion,
+                    image_proto_for_fusion,
                     reliability_mode=phase1_opts.RELIABILITY_MODE,
                     beta_clip_min=phase1_opts.BETA_CLIP_MIN,
                     beta_clip_max=phase1_opts.BETA_CLIP_MAX,
                 )
                 fused_proto = fuse_prototypes(
-                    image_proto.unsqueeze(0),
-                    text_proto.unsqueeze(0),
+                    image_proto_for_fusion.unsqueeze(0),
+                    text_proto_for_fusion.unsqueeze(0),
                     beta_x.view(-1, 1, 1),
                     geometry=phase1_opts.FUSION_GEOMETRY,
                 )
-                logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat, fused_proto)
+                if phase7_state and phase7_state.get("enabled", False) and phase7_state.get("source", "mixed") == "mixed":
+                    fused_proto = self.phase7_transform_prototypes(fused_proto, phase7_state)
+                logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat_for_proto, fused_proto)
                 beta_info["beta"] = beta_x.detach()
             else:
                 fused_proto = fuse_prototypes(
-                    image_proto,
-                    text_proto,
+                    image_proto_for_fusion,
+                    text_proto_for_fusion,
                     beta,
                     geometry=phase1_opts.FUSION_GEOMETRY,
                 )
-                logits_proto_fused = img_feat @ fused_proto.t()
+                if phase7_state and phase7_state.get("enabled", False) and phase7_state.get("source", "mixed") == "mixed":
+                    fused_proto = self.phase7_transform_prototypes(fused_proto, phase7_state)
+                logits_proto_fused = img_feat_for_proto @ fused_proto.t()
                 if isinstance(beta, torch.Tensor):
                     beta_info["beta"] = beta.detach()
         prob_fused_proto = F.softmax(logits_proto_fused, dim=-1)

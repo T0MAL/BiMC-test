@@ -70,3 +70,73 @@ TRAINER:
       DESC_TOPK: 5
 
       SAVE_PHASE2_REPORT: true
+
+    PHASE5:
+      ENABLED: false
+
+      SPACE_TRANSFORM: "none"
+      # allowed: "none", "common_direction_removal", "whitening", "lda_shrinkage"
+
+      APPLY_TO: "all"
+      # allowed: "query_only", "prototype_only", "all"
+
+      CDR_RHO: 0.5
+      CDR_SOURCE: "prototypes"
+      # allowed: "prototypes", "base_features", "all_seen_features"
+
+      WHITENING_EPS: 1e-4
+      WHITENING_SOURCE: "base_features"
+      WHITENING_DIAG_ONLY: true
+
+      LDA_DIM: 256
+      LDA_GAMMA: 1e-3
+      LDA_NOVEL_WEIGHT: 0.1
+      LDA_SOURCE: "base_plus_support"
+      LDA_USE_SHRINKAGE: true
+
+      SAVE_PHASE5_REPORT: true
+
+    PHASE6:
+      ENABLED: false
+
+      ALIGNMENT_MODE: "none"
+      # allowed: "none", "ot_text_image", "support_aware_text", "label_prior_correction"
+
+      OT_EPS: 0.05
+      OT_MAX_ITER: 50
+      OT_USE_SINKHORN: true
+      OT_NORMALIZE_COST: true
+
+      SUPPORT_AWARE_TEXT_TEMP: 0.05
+      SUPPORT_AWARE_TEXT_TOPK: 0
+
+      LABEL_PRIOR_ENABLED: false
+      LABEL_PRIOR_MODE: "blackbox_shift"
+      # allowed: "blackbox_shift", "prediction_frequency", "uniform_smoothing"
+
+      LABEL_PRIOR_STRENGTH: 0.5
+      LABEL_PRIOR_EPS: 1e-8
+      LABEL_PRIOR_MAX_ITER: 20
+      LABEL_PRIOR_TRANSDUCTIVE: true
+
+      SAVE_PHASE6_REPORT: true
+
+    PHASE7:
+      ENABLED: false
+
+      SEPARATION_MODE: "none"
+      # allowed: "none", "hubness_safe_repulsion", "prototype_repulsion", "graph_highpass"
+
+      REPULSION_DELTA: 0.03
+      REPULSION_MARGIN: 0.0
+      REPULSION_TOPK: 5
+      REPULSION_ONLY_IF_SIM_ABOVE_MARGIN: true
+      REPULSION_SOURCE: "mixed"
+      # allowed: "mixed", "text", "visual"
+
+      GRAPH_TAU: 0.05
+      GRAPH_GAMMA: 0.03
+      GRAPH_TOPK: 5
+      GRAPH_NORMALIZE_ADJ: true
+
+      SAVE_PHASE7_REPORT: true

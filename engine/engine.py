@@ -152,6 +152,8 @@ class Runner:
                                                    description_targets,
                                                    text_features,
                                                    beta=beta,
+                                                   support_features=state_dict.get('images_features'),
+                                                   support_labels=state_dict.get('images_targets'),
                                                    return_beta_info=True)
             if beta_info.get("beta") is not None:
                 beta_chunks.append(beta_info["beta"])

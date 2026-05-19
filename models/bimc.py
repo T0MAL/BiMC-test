@@ -4,6 +4,17 @@ import torch.nn.functional as F
 import models.clip.clip as clip
 import json
 from utils.phase1_fusion import compute_query_reliability_beta, fuse_prototypes
+from utils.phase2_prototypes import refine_description_prototypes, refine_visual_prototypes
+from utils.phase3_scores import (
+    apply_temperature,
+    compute_dynamic_alpha,
+    compute_hubness_bias,
+    select_hubness_reference,
+)
+from utils.phase4_covariance import combine_novel_auxiliary, prepare_covariance
+from utils.phase5_space import common_direction, remove_common_direction, transform_covariance
+from utils.phase6_alignment import align_text_prototypes, apply_label_prior
+from utils.phase7_separation import separate_prototypes
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -174,12 +185,38 @@ class BiMC(nn.Module):
                                   self.inference_all_description_feature(class_names=class_names, 
                                   gpt_path=self.cfg.DATASET.GPT_PATH,
                                   cls_begin_index=cls_begin_index)
+
+        phase2_opts = self.cfg.TRAINER.BiMC.PHASE2
+        if phase2_opts.ENABLED:
+            description_proto = refine_description_prototypes(
+                description_features=description_features,
+                description_targets=description_targets,
+                description_proto=description_proto,
+                text_proto=text_features,
+                class_ids=class_index,
+                mode=phase2_opts.TEXT_PROTO_MODE,
+                reweight_tau=phase2_opts.TEXT_REWEIGHT_TAU,
+                combine_weight=phase2_opts.TEXT_COMBINE_WEIGHT,
+            )
         
         images_features, images_targets, images_proto = \
                                     self.inference_all_img_feature(loader, cls_begin_index)
 
         if cls_begin_index != 0:
-            if calibrate_novel_vision_proto:
+            if phase2_opts.ENABLED and phase2_opts.VISUAL_PROTO_MODE != "original":
+                print(f'phase2 visual proto refinement on class [{class_index}]')
+                images_proto = refine_visual_prototypes(
+                    visual_proto=images_proto,
+                    base_visual_proto=self.base_vision_prototype,
+                    support_features=images_features,
+                    support_labels=images_targets,
+                    class_ids=class_index,
+                    mode=phase2_opts.VISUAL_PROTO_MODE,
+                    shrinkage=phase2_opts.VISUAL_SHRINKAGE,
+                    dynamic_lambda=phase2_opts.DYNAMIC_LAMBDA_I,
+                    tau=self.cfg.TRAINER.BiMC.TAU,
+                )
+            elif calibrate_novel_vision_proto:
                 print(f'calibrate vision proto on class [{class_index}]')
                 images_proto = self.soft_calibration(self.base_vision_prototype, images_proto)
         else:
@@ -192,6 +229,15 @@ class BiMC(nn.Module):
             cov_images = shrink_cov(cov_images, alpha1=self.cfg.TRAINER.BiMC.GAMMA_BASE) 
         else:
             cov_images = shrink_cov(cov_images, alpha1=self.cfg.TRAINER.BiMC.GAMMA_INC)
+
+        phase4_opts = self.cfg.TRAINER.BiMC.PHASE4
+        if phase4_opts.ENABLED:
+            cov_images = prepare_covariance(
+                cov_images,
+                mode=phase4_opts.COV_MODE,
+                hybrid_diag_weight=phase4_opts.HYBRID_DIAG_WEIGHT,
+                eps=phase4_opts.EPS,
+            )
 
         
         print('finish loading covariance')
@@ -221,14 +267,15 @@ class BiMC(nn.Module):
                            description_features, description_targets,
                            text_features,
                            beta,
+                           support_features=None,
+                           support_labels=None,
                            return_beta_info=False):
-    
+
         def knn_similarity_scores(queries, support_features, support_labels):
             """
             Compute the similarity between each query sample and all support samples,
             and retrieve the maximum score for each class per query.
             """
-            # Ensure all inputs are on the same device
             device = queries.device
             support_features = support_features.to(device)
             support_labels = support_labels.to(device)
@@ -254,7 +301,7 @@ class BiMC(nn.Module):
 
         def _cov_forward(feat, proto, cov):
             """
-            Perform a forward pass computing negative Mahalanobis distance between 
+            Perform a forward pass computing negative Mahalanobis distance between
             features and each class prototype using a shared covariance matrix.
             """
             maha_dist = []
@@ -267,13 +314,59 @@ class BiMC(nn.Module):
             maha_dist = torch.stack(maha_dist)
             logits = -maha_dist.T
             return logits
-        
 
-        # Normalize the image features
+
         img_feat = self.extract_img_feature(images)
         img_feat = F.normalize(img_feat, dim=-1)
 
         text_proto = self.calibrated_text_proto(text_features, description_proto)
+        phase6_opts = self.cfg.TRAINER.BiMC.PHASE6
+        phase7_opts = self.cfg.TRAINER.BiMC.PHASE7
+        phase5_opts = self.cfg.TRAINER.BiMC.PHASE5
+        prototype_phase_enabled = phase6_opts.ENABLED or phase7_opts.ENABLED or phase5_opts.ENABLED
+        if prototype_phase_enabled:
+            image_proto = F.normalize(image_proto, dim=-1)
+            text_proto = F.normalize(text_proto, dim=-1)
+            description_proto = F.normalize(description_proto, dim=-1)
+            description_features = F.normalize(description_features, dim=-1)
+
+        if phase6_opts.ENABLED:
+            text_proto = align_text_prototypes(
+                text_proto,
+                image_proto,
+                mode=phase6_opts.ALIGNMENT_MODE,
+                strength=phase6_opts.ALIGNMENT_STRENGTH,
+                ot_tau=phase6_opts.OT_TAU,
+            )
+
+        if phase7_opts.ENABLED:
+            image_proto = separate_prototypes(
+                image_proto,
+                mode=phase7_opts.SEPARATION_MODE,
+                strength=phase7_opts.SEPARATION_STRENGTH,
+                graph_k=phase7_opts.GRAPH_K,
+            )
+            text_proto = separate_prototypes(
+                text_proto,
+                mode=phase7_opts.SEPARATION_MODE,
+                strength=phase7_opts.SEPARATION_STRENGTH,
+                graph_k=phase7_opts.GRAPH_K,
+            )
+
+        if phase5_opts.ENABLED and phase5_opts.SPACE_TRANSFORM == "common_direction_removal":
+            direction = common_direction(
+                [image_proto, text_proto, description_proto, description_features],
+                eps=phase5_opts.EPS,
+            )
+            if phase5_opts.APPLY_TO in ("all", "queries"):
+                img_feat = remove_common_direction(img_feat, direction, strength=phase5_opts.STRENGTH)
+            if phase5_opts.APPLY_TO in ("all", "prototypes"):
+                image_proto = remove_common_direction(image_proto, direction, strength=phase5_opts.STRENGTH)
+                text_proto = remove_common_direction(text_proto, direction, strength=phase5_opts.STRENGTH)
+                description_proto = remove_common_direction(description_proto, direction, strength=phase5_opts.STRENGTH)
+                description_features = remove_common_direction(description_features, direction, strength=phase5_opts.STRENGTH)
+                cov_image = transform_covariance(cov_image, direction, strength=phase5_opts.STRENGTH, eps=phase5_opts.EPS)
+
         phase1_opts = self.cfg.TRAINER.BiMC
         beta_info = {
             "mode": phase1_opts.FUSION_BETA_MODE,
@@ -281,7 +374,6 @@ class BiMC(nn.Module):
             "beta": None,
         }
 
-        # Preserve the original BiMC formula exactly for the default baseline.
         if phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
             fused_proto = beta * text_proto + (1 - beta) * image_proto
             fused_proto = F.normalize(fused_proto, dim=-1)
@@ -289,7 +381,6 @@ class BiMC(nn.Module):
         else:
             text_proto = F.normalize(text_proto, dim=-1)
             image_proto = F.normalize(image_proto, dim=-1)
-
             if phase1_opts.FUSION_BETA_MODE == "query_reliability":
                 beta_x = compute_query_reliability_beta(
                     img_feat,
@@ -317,12 +408,43 @@ class BiMC(nn.Module):
                 logits_proto_fused = img_feat @ fused_proto.t()
                 if isinstance(beta, torch.Tensor):
                     beta_info["beta"] = beta.detach()
-        prob_fused_proto = F.softmax(logits_proto_fused, dim=-1)
+
+        phase3_opts = self.cfg.TRAINER.BiMC.PHASE3
+        if phase3_opts.ENABLED and phase3_opts.HUBNESS_ENABLED:
+            hub_reference = select_hubness_reference(
+                phase3_opts.HUBNESS_SOURCE,
+                support_features=support_features,
+                description_features=description_features,
+            )
+            hub_proto = fused_proto if fused_proto.ndim == 2 else fused_proto.mean(dim=0)
+            hub_bias = compute_hubness_bias(
+                hub_reference,
+                hub_proto,
+                strength=phase3_opts.HUBNESS_STRENGTH,
+            )
+            logits_proto_fused = logits_proto_fused - hub_bias.view(1, -1)
+
+        logits_proto_scaled = apply_temperature(
+            logits_proto_fused,
+            enabled=phase3_opts.ENABLED and phase3_opts.TEMP_SCALING_ENABLED,
+            temperature=phase3_opts.TEMP_VALUE,
+        )
+        prob_fused_proto = F.softmax(logits_proto_scaled, dim=-1)
 
         logits_cov = _cov_forward(img_feat, image_proto, cov_image)
-        logits_knn = knn_similarity_scores(img_feat, description_features, description_targets)    
-        prob_cov = F.softmax(logits_cov / 512, dim=-1)
-        prob_knn = F.softmax(logits_knn, dim=-1)
+        logits_knn = knn_similarity_scores(img_feat, description_features, description_targets)
+        logits_cov_scaled = apply_temperature(
+            logits_cov / 512,
+            enabled=phase3_opts.ENABLED and phase3_opts.TEMP_SCALING_ENABLED,
+            temperature=phase3_opts.TEMP_VALUE,
+        )
+        logits_knn_scaled = apply_temperature(
+            logits_knn,
+            enabled=phase3_opts.ENABLED and phase3_opts.TEMP_SCALING_ENABLED,
+            temperature=phase3_opts.TEMP_VALUE,
+        )
+        prob_cov = F.softmax(logits_cov_scaled, dim=-1)
+        prob_knn = F.softmax(logits_knn_scaled, dim=-1)
 
         NUM_BASE_CLS = num_base_cls
         use_diversity = self.cfg.TRAINER.BiMC.USING_ENSEMBLE
@@ -331,10 +453,47 @@ class BiMC(nn.Module):
         else:
             ensemble_alpha = 1.0
 
-        base_probs = ensemble_alpha * prob_fused_proto[:, :NUM_BASE_CLS] + (1 - ensemble_alpha) * prob_cov[:, :NUM_BASE_CLS]
-        inc_probs = ensemble_alpha * prob_fused_proto[:, NUM_BASE_CLS:] + (1 - ensemble_alpha) * prob_knn[:, NUM_BASE_CLS:]
+        phase4_opts = self.cfg.TRAINER.BiMC.PHASE4
+        novel_aux_probs = prob_knn[:, NUM_BASE_CLS:]
+        novel_aux_logits = logits_knn_scaled[:, NUM_BASE_CLS:]
+        if phase4_opts.ENABLED and phase4_opts.APPLY_TO_NOVEL and prob_knn.shape[1] > NUM_BASE_CLS:
+            novel_aux_probs = combine_novel_auxiliary(
+                prob_knn[:, NUM_BASE_CLS:],
+                prob_cov[:, NUM_BASE_CLS:],
+                replace_novel_nn=phase4_opts.REPLACE_NOVEL_NN,
+                combine_mode=phase4_opts.NOVEL_AUX_COMBINE_MODE,
+            )
+            if phase4_opts.REPLACE_NOVEL_NN:
+                novel_aux_logits = logits_cov_scaled[:, NUM_BASE_CLS:]
+            elif phase4_opts.NOVEL_AUX_COMBINE_MODE == "average":
+                novel_aux_logits = 0.5 * (logits_knn_scaled[:, NUM_BASE_CLS:] + logits_cov_scaled[:, NUM_BASE_CLS:])
+
+        aux_probs = torch.cat([prob_cov[:, :NUM_BASE_CLS], novel_aux_probs], dim=1)
+        aux_logits = torch.cat([logits_cov_scaled[:, :NUM_BASE_CLS], novel_aux_logits], dim=1)
+
+        if phase3_opts.ENABLED and phase3_opts.DYNAMIC_ALPHA_ENABLED:
+            alpha = compute_dynamic_alpha(
+                logits_proto_scaled,
+                aux_logits,
+                mode=phase3_opts.DYNAMIC_ALPHA_MODE,
+                alpha_clip_min=phase3_opts.ALPHA_CLIP_MIN,
+                alpha_clip_max=phase3_opts.ALPHA_CLIP_MAX,
+                energy_enabled=phase3_opts.ENERGY_ENABLED,
+            ).view(-1, 1)
+        else:
+            alpha = ensemble_alpha
+
+        base_probs = alpha * prob_fused_proto[:, :NUM_BASE_CLS] + (1 - alpha) * aux_probs[:, :NUM_BASE_CLS]
+        inc_probs = alpha * prob_fused_proto[:, NUM_BASE_CLS:] + (1 - alpha) * aux_probs[:, NUM_BASE_CLS:]
 
         prob_fused = torch.cat([base_probs, inc_probs], dim=1)
+        if phase6_opts.ENABLED and phase6_opts.LABEL_PRIOR_ENABLED:
+            prob_fused = apply_label_prior(
+                prob_fused,
+                enabled=phase6_opts.LABEL_PRIOR_ENABLED,
+                transductive=phase6_opts.LABEL_PRIOR_TRANSDUCTIVE,
+                strength=phase6_opts.LABEL_PRIOR_STRENGTH,
+            )
         logits = prob_fused
         if return_beta_info:
             return logits, beta_info

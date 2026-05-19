@@ -8,6 +8,7 @@ from utils.phase1_report import write_phase1_outputs
 from models.bimc import BiMC
 import numpy as np
 import time
+from utils.phase4_covariance import build_phase4_class_diag_vars
 
 
 class Runner:
@@ -35,6 +36,11 @@ class Runner:
         self.eval_results = []
         self.beta_session_records = []
         self.beta_class_records = []
+        self.phase3_score_records = []
+        self.phase4_cov_records = []
+        self.hubness_class_records = []
+        self.dynamic_alpha_records = []
+        self.covariance_class_records = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
 
 
@@ -134,6 +140,12 @@ class Runner:
 
         num_base_class = len(self.data_manager.class_index_in_task[0])
         num_accumulated_class = max(self.data_manager.class_index_in_task[task_id]) + 1
+        phase4_diag_vars = self._prepare_phase4_state(
+            task_id=task_id,
+            state_dict=state_dict,
+            num_base_class=num_base_class,
+            num_accumulated_class=num_accumulated_class,
+        )
         
         test_loader = self.data_manager.get_dataloader(task_id, source='test', mode='test')
         all_logits = []
@@ -152,9 +164,11 @@ class Runner:
                                                    description_targets,
                                                    text_features,
                                                    beta=beta,
+                                                   phase4_diag_vars=phase4_diag_vars,
                                                    return_beta_info=True)
             if beta_info.get("beta") is not None:
                 beta_chunks.append(beta_info["beta"])
+            self._collect_phase34_info(task_id, i, beta_info)
 
             all_logits.append(logits)
             all_targets.append(targets)
@@ -171,6 +185,68 @@ class Runner:
         self.beta_class_records.extend(beta_class_records)
         print(f"Test acc mean: {eval_acc['mean_acc']}, task-wise acc: {eval_acc['task_acc']}")
         return eval_acc
+
+
+    def _prepare_phase4_state(self, task_id, state_dict, num_base_class, num_accumulated_class):
+        opts = self.cfg.TRAINER.BiMC.PHASE4
+        if not opts.ENABLED or opts.COV_MODE == "original":
+            return None
+
+        class_diag_vars, stats, class_records = build_phase4_class_diag_vars(
+            support_features=state_dict["images_features"],
+            support_labels=state_dict["images_targets"],
+            class_protos=state_dict["image_proto"][:num_accumulated_class],
+            num_base_classes=num_base_class,
+            cov_mode=opts.COV_MODE,
+            cov_prior=opts.COV_PRIOR,
+            shrinkage_lambda=opts.COV_SHRINKAGE_LAMBDA,
+            eps=opts.COV_EPS,
+            tau=opts.COV_TAU,
+            apply_to_novel=opts.APPLY_TO_NOVEL,
+            apply_to_base=opts.APPLY_TO_BASE,
+        )
+        if class_diag_vars is None:
+            return None
+
+        session_stats = {"session": int(task_id)}
+        session_stats.update(stats)
+        session_stats.update({
+            "replace_novel_nn": bool(opts.REPLACE_NOVEL_NN),
+            "novel_aux_combine_mode": opts.NOVEL_AUX_COMBINE_MODE,
+            "cov_score_temp": float(opts.COV_SCORE_TEMP),
+            "cov_score_weight": float(opts.COV_SCORE_WEIGHT),
+        })
+        self.phase4_cov_records.append(session_stats)
+        for record in class_records:
+            class_record = {"session": int(task_id)}
+            class_record.update(record)
+            self.covariance_class_records.append(class_record)
+        return class_diag_vars
+
+
+    def _collect_phase34_info(self, task_id, batch_id, beta_info):
+        phase3 = beta_info.get("phase3", {})
+        if phase3:
+            record = {"session": int(task_id), "batch": int(batch_id)}
+            record.update(phase3)
+            self.phase3_score_records.append(record)
+
+        phase4 = beta_info.get("phase4", {})
+        if phase4:
+            record = {"session": int(task_id), "batch": int(batch_id)}
+            record.update(phase4)
+            self.phase4_cov_records.append(record)
+
+        if batch_id == 0:
+            for record in beta_info.get("hubness_by_class", []):
+                class_record = {"session": int(task_id)}
+                class_record.update(record)
+                self.hubness_class_records.append(class_record)
+
+        for record in beta_info.get("dynamic_alpha", []):
+            alpha_record = {"session": int(task_id), "batch": int(batch_id)}
+            alpha_record.update(record)
+            self.dynamic_alpha_records.append(alpha_record)
 
 
     def _prepare_session_beta(self, task_id, state_dict):
@@ -230,14 +306,22 @@ class Runner:
 
 
     def _save_phase1_outputs(self, comparison_rows=None):
+        phase34_records = {
+            "phase3_score_records": self.phase3_score_records,
+            "phase4_cov_records": self.phase4_cov_records,
+            "hubness_class_records": self.hubness_class_records,
+            "dynamic_alpha_records": self.dynamic_alpha_records,
+            "covariance_class_records": self.covariance_class_records,
+        }
         if not self.cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT:
             return {
                 "run_dir": None,
                 "session_metrics": self.eval_results,
                 "beta_session_records": self.beta_session_records,
                 "beta_class_records": self.beta_class_records,
+                **phase34_records,
             }
-        return write_phase1_outputs(
+        summary = write_phase1_outputs(
             cfg=self.cfg,
             dataset_name=self.data_manager.dataset_name,
             session_metrics=self.eval_results,
@@ -249,6 +333,8 @@ class Runner:
                 "Query-wise beta is computed per test batch from unlabeled query features only.",
             ],
         )
+        summary.update(phase34_records)
+        return summary
     
 
     def parse_batch(self, batch):

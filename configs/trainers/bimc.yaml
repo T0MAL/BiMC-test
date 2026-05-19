@@ -41,3 +41,75 @@ TRAINER:
     BETA_CLIP_MAX: 0.95
     RELIABILITY_MODE: "entropy_margin"
     SAVE_PHASE1_REPORT: True
+
+    PHASE3:
+      ENABLED: false
+
+      HUBNESS_ENABLED: false
+      HUBNESS_SOURCE: "mixed"
+      # allowed: "mixed", "text", "visual", "all"
+      HUBNESS_TAU: 0.05
+      HUBNESS_LAMBDA: 0.05
+      HUBNESS_TOPK: 0
+      # 0 means use all prototypes. Otherwise use top-k nearest prototypes.
+
+      TEMP_SCALING_ENABLED: false
+      TEMP_CALIB: 1.0
+      TEMP_COV: 1.0
+      TEMP_NN: 1.0
+      TEMP_TEXT: 1.0
+      TEMP_VISUAL: 1.0
+
+      ENERGY_ENABLED: false
+      ENERGY_TEMP: 1.0
+      ENERGY_NORMALIZE: true
+
+      DYNAMIC_ALPHA_ENABLED: false
+      DYNAMIC_ALPHA_MODE: "entropy_margin"
+      # allowed:
+      # "margin"
+      # "entropy"
+      # "entropy_margin"
+      # "energy"
+      # "entropy_margin_energy"
+
+      ALPHA_CLIP_MIN: 0.05
+      ALPHA_CLIP_MAX: 0.95
+      ALPHA_EPS: 1e-8
+
+      SAVE_PHASE3_REPORT: true
+
+    PHASE4:
+      ENABLED: false
+
+      COV_MODE: "original"
+      # allowed:
+      # "original"
+      # "diag_shrinkage"
+      # "base_borrowed_diag"
+      # "hybrid_diag"
+
+      APPLY_TO_NOVEL: true
+      APPLY_TO_BASE: false
+
+      COV_SHRINKAGE_LAMBDA: 0.5
+      COV_EPS: 1e-4
+      COV_TAU: 16.0
+
+      COV_PRIOR: "base_neighbors"
+      # allowed:
+      # "base_neighbors"
+      # "global"
+      # "identity"
+
+      COV_SCORE_TEMP: 1.0
+      COV_SCORE_WEIGHT: 1.0
+
+      REPLACE_NOVEL_NN: false
+      # If true, use phase4 covariance score instead of CMNN for novel classes.
+      # If false, report it as an additional auxiliary and optionally combine.
+
+      NOVEL_AUX_COMBINE_MODE: "alpha"
+      # allowed: "alpha", "average", "max", "replace"
+
+      SAVE_PHASE4_REPORT: true

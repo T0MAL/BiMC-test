@@ -1,6 +1,8 @@
 from yacs.config import CfgNode as CN
 from utils.util import set_gpu, set_seed
 from utils.phase1_fusion import (
+    VALID_CNN_EXPERIMENT_MODES,
+    VALID_CNN_PROJECTIONS,
     VALID_FUSION_BETA_MODES,
     VALID_FUSION_GEOMETRIES,
     VALID_RELIABILITY_MODES,
@@ -84,6 +86,13 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.BETA_CLIP_MAX = 0.95
     cfg.TRAINER.BiMC.RELIABILITY_MODE = 'entropy_margin'
     cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT = True
+    cfg.TRAINER.BiMC.USE_CNN_BRANCH = False
+    cfg.TRAINER.BiMC.CNN_BACKBONE = 'resnet50'
+    cfg.TRAINER.BiMC.CNN_EXPERIMENT_MODE = 'none'
+    cfg.TRAINER.BiMC.CNN_LAMBDA = 0.10
+    cfg.TRAINER.BiMC.CNN_TOPK = 5
+    cfg.TRAINER.BiMC.CNN_PROJECTION = 'random_orthogonal'
+    cfg.TRAINER.BiMC.CNN_CACHE_FEATURES = True
 
 
 
@@ -130,12 +139,28 @@ def apply_cli_overrides(cfg, args):
         cfg.TRAINER.BiMC.RELIABILITY_MODE = args.reliability_mode
     if args.save_phase1_report is not None:
         cfg.TRAINER.BiMC.SAVE_PHASE1_REPORT = args.save_phase1_report
+    if args.use_cnn_branch is not None:
+        cfg.TRAINER.BiMC.USE_CNN_BRANCH = args.use_cnn_branch
+    if args.cnn_backbone is not None:
+        cfg.TRAINER.BiMC.CNN_BACKBONE = args.cnn_backbone
+    if args.cnn_experiment_mode is not None:
+        cfg.TRAINER.BiMC.CNN_EXPERIMENT_MODE = args.cnn_experiment_mode
+    if args.cnn_lambda is not None:
+        cfg.TRAINER.BiMC.CNN_LAMBDA = args.cnn_lambda
+    if args.cnn_topk is not None:
+        cfg.TRAINER.BiMC.CNN_TOPK = args.cnn_topk
+    if args.cnn_projection is not None:
+        cfg.TRAINER.BiMC.CNN_PROJECTION = args.cnn_projection
+    if args.cnn_cache_features is not None:
+        cfg.TRAINER.BiMC.CNN_CACHE_FEATURES = args.cnn_cache_features
     if args.output_dir is not None:
         cfg.OUTPUT_DIR = args.output_dir
     if args.run_name is not None:
         cfg.RUN_NAME = args.run_name
     if args.phase1_timestamp is not None:
         cfg.PHASE1_TIMESTAMP = args.phase1_timestamp
+    if args.seed is not None:
+        cfg.SEED = args.seed
     cfg.freeze()
     return cfg
 
@@ -153,9 +178,17 @@ def main():
     parser.add_argument('--beta_clip_max', type=float)
     parser.add_argument('--reliability_mode', type=str, choices=VALID_RELIABILITY_MODES)
     parser.add_argument('--save_phase1_report', type=str2bool, nargs='?', const=True)
+    parser.add_argument('--use_cnn_branch', type=str2bool, nargs='?', const=True)
+    parser.add_argument('--cnn_backbone', type=str)
+    parser.add_argument('--cnn_experiment_mode', type=str, choices=VALID_CNN_EXPERIMENT_MODES)
+    parser.add_argument('--cnn_lambda', type=float)
+    parser.add_argument('--cnn_topk', type=int)
+    parser.add_argument('--cnn_projection', type=str, choices=VALID_CNN_PROJECTIONS)
+    parser.add_argument('--cnn_cache_features', type=str2bool, nargs='?', const=True)
     parser.add_argument('--output_dir', type=str)
     parser.add_argument('--run_name', type=str)
     parser.add_argument('--phase1_timestamp', type=str)
+    parser.add_argument('--seed', type=int)
 
     args = parser.parse_args()
 

@@ -3,7 +3,13 @@ import torch.nn as nn
 from datasets.data_manager import DatasetManager
 from tqdm import tqdm
 from utils.evaluator import AccuracyEvaluator
-from utils.phase1_fusion import beta_statistics, compute_class_margin_beta, validate_phase1_options
+from utils.phase1_fusion import (
+    beta_statistics,
+    cnn_uses_query_beta,
+    compute_class_margin_beta,
+    get_active_cnn_mode,
+    validate_phase1_options,
+)
 from utils.phase1_report import write_phase1_outputs
 from models.bimc import BiMC
 import numpy as np
@@ -61,6 +67,15 @@ class Runner:
         for key in keys_to_merge:
             result[key] = torch.cat([d[key] for d in dict_list], dim=0)
 
+        optional_concat_keys = [
+            'cnn_features',
+            'cnn_targets',
+            'cnn_proto',
+            'cnn_projected_proto',
+        ]
+        for key in optional_concat_keys:
+            if all(key in d for d in dict_list):
+                result[key] = torch.cat([d[key] for d in dict_list], dim=0)
 
         weights = [len(d['class_index']) for d in dict_list]
 
@@ -123,6 +138,7 @@ class Runner:
     @torch.no_grad()
     def inference_task_covariance(self, task_id, state_dict):
 
+        opts = self.cfg.TRAINER.BiMC
         beta, beta_values, beta_class_records = self._prepare_session_beta(task_id, state_dict)
 
         image_proto = state_dict['image_proto']
@@ -152,6 +168,7 @@ class Runner:
                                                    description_targets,
                                                    text_features,
                                                    beta=beta,
+                                                   cnn_proto=state_dict.get('cnn_proto'),
                                                    return_beta_info=True)
             if beta_info.get("beta") is not None:
                 beta_chunks.append(beta_info["beta"])
@@ -169,6 +186,15 @@ class Runner:
         eval_acc["beta_stats"] = beta_record
         self.beta_session_records.append(beta_record)
         self.beta_class_records.extend(beta_class_records)
+        if beta_record["beta_count"] > 0:
+            print(
+                "Beta stats: "
+                f"session={task_id}, mode={opts.FUSION_BETA_MODE}, "
+                f"cnn_mode={get_active_cnn_mode(opts)}, "
+                f"mean={beta_record['beta_mean']:.4f}, "
+                f"min={beta_record['beta_min']:.4f}, "
+                f"max={beta_record['beta_max']:.4f}"
+            )
         print(f"Test acc mean: {eval_acc['mean_acc']}, task-wise acc: {eval_acc['task_acc']}")
         return eval_acc
 
@@ -176,6 +202,8 @@ class Runner:
     def _prepare_session_beta(self, task_id, state_dict):
         opts = self.cfg.TRAINER.BiMC
         num_accumulated_class = max(self.data_manager.class_index_in_task[task_id]) + 1
+        if cnn_uses_query_beta(get_active_cnn_mode(opts)):
+            return float(self.cfg.DATASET.BETA), None, []
 
         if opts.FUSION_BETA_MODE == "fixed":
             beta = float(self.cfg.DATASET.BETA)

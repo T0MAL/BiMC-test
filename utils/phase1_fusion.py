@@ -7,6 +7,15 @@ import torch.nn.functional as F
 VALID_FUSION_BETA_MODES = ("fixed", "class_margin", "query_reliability")
 VALID_FUSION_GEOMETRIES = ("linear", "slerp")
 VALID_RELIABILITY_MODES = ("margin", "entropy", "entropy_margin")
+VALID_CNN_EXPERIMENT_MODES = (
+    "none",
+    "cnn_proto_adjust",
+    "cnn_query_beta",
+    "cnn_proto_adjust_plus_query_beta",
+)
+VALID_CNN_PROJECTIONS = ("random_orthogonal", "identity_pad")
+CNN_PROTO_ADJUST_MODES = ("cnn_proto_adjust", "cnn_proto_adjust_plus_query_beta")
+CNN_QUERY_BETA_MODES = ("cnn_query_beta", "cnn_proto_adjust_plus_query_beta")
 
 
 def validate_phase1_options(cfg):
@@ -30,6 +39,36 @@ def validate_phase1_options(cfg):
         raise ValueError("BETA_TEMPERATURE must be positive.")
     if not 0 <= opts.BETA_CLIP_MIN <= opts.BETA_CLIP_MAX <= 1:
         raise ValueError("Expected 0 <= BETA_CLIP_MIN <= BETA_CLIP_MAX <= 1.")
+    if not hasattr(opts, "USE_CNN_BRANCH"):
+        return
+    if opts.CNN_EXPERIMENT_MODE not in VALID_CNN_EXPERIMENT_MODES:
+        raise ValueError(
+            f"Invalid CNN experiment mode {opts.CNN_EXPERIMENT_MODE}. "
+            f"Expected one of {VALID_CNN_EXPERIMENT_MODES}."
+        )
+    if opts.CNN_PROJECTION not in VALID_CNN_PROJECTIONS:
+        raise ValueError(
+            f"Invalid CNN projection {opts.CNN_PROJECTION}. "
+            f"Expected one of {VALID_CNN_PROJECTIONS}."
+        )
+    if not 0 <= opts.CNN_LAMBDA <= 1:
+        raise ValueError("Expected 0 <= CNN_LAMBDA <= 1.")
+    if opts.CNN_TOPK < 1:
+        raise ValueError("CNN_TOPK must be at least 1.")
+
+
+def get_active_cnn_mode(opts):
+    if not getattr(opts, "USE_CNN_BRANCH", False):
+        return "none"
+    return getattr(opts, "CNN_EXPERIMENT_MODE", "none")
+
+
+def cnn_uses_proto_adjust(mode):
+    return mode in CNN_PROTO_ADJUST_MODES
+
+
+def cnn_uses_query_beta(mode):
+    return mode in CNN_QUERY_BETA_MODES
 
 
 def clamp_beta(beta, beta_clip_min, beta_clip_max):
@@ -200,6 +239,13 @@ def _reliability(probabilities, mode):
     raise ValueError(f"Unknown reliability mode: {mode}")
 
 
+def compute_reliability_from_scores(scores, reliability_mode, topk=None):
+    if topk is not None and 0 < topk < scores.shape[-1]:
+        scores = scores.topk(k=topk, dim=-1).values
+    probabilities = F.softmax(scores, dim=-1)
+    return _reliability(probabilities, reliability_mode)
+
+
 def compute_query_reliability_beta(
     query_features,
     text_proto,
@@ -217,14 +263,126 @@ def compute_query_reliability_beta(
     scores_text = query_features @ text_proto.t()
     scores_visual = query_features @ visual_proto.t()
 
-    prob_text = F.softmax(scores_text, dim=-1)
-    prob_visual = F.softmax(scores_visual, dim=-1)
-
-    reliability_text = _reliability(prob_text, reliability_mode)
-    reliability_visual = _reliability(prob_visual, reliability_mode)
+    reliability_text = compute_reliability_from_scores(scores_text, reliability_mode)
+    reliability_visual = compute_reliability_from_scores(scores_visual, reliability_mode)
 
     beta_x = reliability_text / (reliability_text + reliability_visual + eps)
     return clamp_beta(beta_x, beta_clip_min, beta_clip_max)
+
+
+def _orthogonal_projection_matrix(input_dim, output_dim, generator):
+    raw = torch.randn(input_dim, output_dim, generator=generator, dtype=torch.float32)
+    if input_dim >= output_dim:
+        if hasattr(torch, "linalg") and hasattr(torch.linalg, "qr"):
+            q, _ = torch.linalg.qr(raw, mode="reduced")
+        else:
+            q, _ = torch.qr(raw)
+        return q[:, :output_dim]
+
+    if hasattr(torch, "linalg") and hasattr(torch.linalg, "qr"):
+        q, _ = torch.linalg.qr(raw.t(), mode="reduced")
+    else:
+        q, _ = torch.qr(raw.t())
+    return q[:, :input_dim].t()
+
+
+def deterministic_projection_matrix(
+    input_dim,
+    output_dim,
+    projection="random_orthogonal",
+    seed=0,
+    device=None,
+    dtype=None,
+):
+    if input_dim <= 0 or output_dim <= 0:
+        raise ValueError("Projection dimensions must be positive.")
+    if projection not in VALID_CNN_PROJECTIONS:
+        raise ValueError(
+            f"Invalid CNN projection {projection}. Expected one of {VALID_CNN_PROJECTIONS}."
+        )
+
+    if projection == "identity_pad":
+        matrix = torch.zeros(input_dim, output_dim, dtype=torch.float32)
+        diagonal = min(input_dim, output_dim)
+        matrix[:diagonal, :diagonal] = torch.eye(diagonal, dtype=torch.float32)
+    else:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed) + input_dim * 1_000_003 + output_dim * 9_176)
+        matrix = _orthogonal_projection_matrix(input_dim, output_dim, generator)
+
+    if device is not None or dtype is not None:
+        matrix = matrix.to(device=device, dtype=dtype)
+    return matrix
+
+
+def project_cnn_features_to_clip(
+    cnn_features,
+    clip_dim,
+    projection="random_orthogonal",
+    seed=0,
+    projection_matrix=None,
+    return_matrix=False,
+):
+    cnn_features = F.normalize(cnn_features, dim=-1)
+    input_dim = cnn_features.shape[-1]
+    if projection_matrix is None:
+        projection_matrix = deterministic_projection_matrix(
+            input_dim=input_dim,
+            output_dim=clip_dim,
+            projection=projection,
+            seed=seed,
+            device=cnn_features.device,
+            dtype=cnn_features.dtype,
+        )
+    else:
+        projection_matrix = projection_matrix.to(
+            device=cnn_features.device,
+            dtype=cnn_features.dtype,
+        )
+    projected = cnn_features @ projection_matrix
+    projected = F.normalize(projected, dim=-1)
+    if return_matrix:
+        return projected, projection_matrix
+    return projected
+
+
+def compute_cnn_query_reliability_beta(
+    query_clip_features,
+    text_proto,
+    query_cnn_features,
+    cnn_proto,
+    reliability_mode,
+    beta_clip_min,
+    beta_clip_max,
+    cnn_topk=5,
+    eps=1e-12,
+    return_info=False,
+):
+    """Compute query-wise beta from CLIP text reliability and CNN visual reliability."""
+    query_clip_features = F.normalize(query_clip_features, dim=-1)
+    text_proto = F.normalize(text_proto, dim=-1)
+    query_cnn_features = F.normalize(query_cnn_features, dim=-1)
+    cnn_proto = F.normalize(cnn_proto, dim=-1)
+
+    scores_text = query_clip_features @ text_proto.t()
+    scores_cnn = query_cnn_features @ cnn_proto.t()
+
+    reliability_text = compute_reliability_from_scores(scores_text, reliability_mode)
+    reliability_visual = compute_reliability_from_scores(
+        scores_cnn,
+        reliability_mode,
+        topk=min(int(cnn_topk), scores_cnn.shape[-1]),
+    )
+
+    beta_x = reliability_text / (reliability_text + reliability_visual + eps)
+    beta_x = clamp_beta(beta_x, beta_clip_min, beta_clip_max)
+
+    if return_info:
+        return beta_x, {
+            "reliability_text": reliability_text.detach(),
+            "reliability_visual": reliability_visual.detach(),
+        }
+    return beta_x
 
 
 def beta_statistics(values):

@@ -41,3 +41,11 @@ TRAINER:
     BETA_CLIP_MAX: 0.95
     RELIABILITY_MODE: "entropy_margin"
     SAVE_PHASE1_REPORT: True
+
+    USE_CNN_BRANCH: False
+    CNN_BACKBONE: "resnet50"
+    CNN_EXPERIMENT_MODE: "none"
+    CNN_LAMBDA: 0.10
+    CNN_TOPK: 5
+    CNN_PROJECTION: "random_orthogonal"
+    CNN_CACHE_FEATURES: True

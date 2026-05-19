@@ -3,7 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import models.clip.clip as clip
 import json
-from utils.phase1_fusion import compute_query_reliability_beta, fuse_prototypes
+from utils.phase1_fusion import (
+    cnn_uses_proto_adjust,
+    cnn_uses_query_beta,
+    compute_cnn_query_reliability_beta,
+    compute_query_reliability_beta,
+    fuse_prototypes,
+    get_active_cnn_mode,
+    project_cnn_features_to_clip,
+)
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -21,6 +29,12 @@ def load_clip_to_cpu(cfg):
     model = clip.build_model(state_dict or model.state_dict())
 
     return model
+
+
+CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
+IMAGENET_IMAGE_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_IMAGE_STD = (0.229, 0.224, 0.225)
 
 
 class BiMC(nn.Module):
@@ -43,6 +57,101 @@ class BiMC(nn.Module):
         self.text_proto = None
         self.description_proto = None
         self.vision_proto = None
+        self.cnn_feature_extractor = None
+        self.cnn_feature_dim = None
+        self._cnn_projection_matrices = {}
+        self._cnn_support_cache = {}
+        self._init_cnn_branch()
+
+
+    def _cnn_opts(self):
+        return self.cfg.TRAINER.BiMC
+
+
+    def _active_cnn_mode(self):
+        return get_active_cnn_mode(self._cnn_opts())
+
+
+    def _cnn_enabled(self):
+        return self._active_cnn_mode() != "none"
+
+
+    def _init_cnn_branch(self):
+        opts = self._cnn_opts()
+        mode = self._active_cnn_mode()
+        print(
+            "CNN branch: "
+            f"mode={mode}, backbone={opts.CNN_BACKBONE}, lambda={opts.CNN_LAMBDA}, "
+            f"topk={opts.CNN_TOPK}, projection={opts.CNN_PROJECTION}, "
+            f"cache_features={opts.CNN_CACHE_FEATURES}"
+        )
+        if mode == "none":
+            return
+
+        self.cnn_feature_extractor, self.cnn_feature_dim = self._build_cnn_backbone(opts.CNN_BACKBONE)
+        self.cnn_feature_extractor = self.cnn_feature_extractor.to(self.device)
+        self.cnn_feature_extractor.eval()
+        for param in self.cnn_feature_extractor.parameters():
+            param.requires_grad_(False)
+        print(f"Frozen CNN backbone ready: {opts.CNN_BACKBONE}, feature_dim={self.cnn_feature_dim}")
+
+
+    def _build_cnn_backbone(self, backbone_name):
+        try:
+            import torchvision.models as tv_models
+        except ImportError as exc:
+            raise ImportError(
+                "CNN BiMC modes require torchvision. Install torchvision or set "
+                "CNN_EXPERIMENT_MODE=none."
+            ) from exc
+
+        constructor = getattr(tv_models, backbone_name, None)
+        if constructor is None:
+            raise ValueError(f"Unsupported torchvision CNN backbone: {backbone_name}")
+
+        weights_cls_name = self._torchvision_weights_class_name(backbone_name)
+        weights_cls = getattr(tv_models, weights_cls_name, None)
+        attempts = []
+        if weights_cls is not None:
+            weights = getattr(weights_cls, "DEFAULT", None)
+            if weights is not None:
+                attempts.append(("pretrained weights", {"weights": weights}))
+        attempts.append(("legacy pretrained=True", {"pretrained": True}))
+        attempts.append(("random initialization fallback", {}))
+
+        last_error = None
+        model = None
+        for label, kwargs in attempts:
+            try:
+                model = constructor(**kwargs)
+                print(f"Loaded {backbone_name} with {label}.")
+                break
+            except TypeError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+                print(f"Could not load {backbone_name} with {label}: {exc}")
+
+        if model is None:
+            raise RuntimeError(f"Failed to construct CNN backbone {backbone_name}: {last_error}")
+
+        if hasattr(model, "fc") and hasattr(model.fc, "in_features"):
+            feature_dim = model.fc.in_features
+            model.fc = nn.Identity()
+            return model, feature_dim
+
+        raise ValueError(
+            f"Backbone {backbone_name} is not supported as a feature extractor. "
+            "Use a torchvision ResNet-style model with an fc layer."
+        )
+
+
+    def _torchvision_weights_class_name(self, backbone_name):
+        if backbone_name.startswith("resnet"):
+            suffix = backbone_name.replace("resnet", "")
+            return f"ResNet{suffix}_Weights"
+        parts = backbone_name.split("_")
+        return "".join(part[:1].upper() + part[1:] for part in parts) + "_Weights"
 
 
     @torch.no_grad()
@@ -95,6 +204,88 @@ class BiMC(nn.Module):
         prototypes = torch.stack(prototypes, dim=0)
         prototypes = F.normalize(prototypes, dim=-1)
         return all_features, all_labels, prototypes
+
+
+    @torch.no_grad()
+    def inference_all_cnn_feature(self, loader, cls_begin_index):
+        cache_key = None
+        if self._cnn_opts().CNN_CACHE_FEATURES:
+            cache_key = (id(loader.dataset), int(cls_begin_index), self._cnn_opts().CNN_BACKBONE)
+            if cache_key in self._cnn_support_cache:
+                return self._cnn_support_cache[cache_key]
+
+        all_features = []
+        all_labels = []
+        for batch in loader:
+            images, labels = self.parse_batch(batch)
+            features = self.extract_cnn_feature(images)
+            all_features.append(features)
+            all_labels.append(labels)
+        all_features = torch.cat(all_features, dim=0)
+        all_features = F.normalize(all_features, dim=-1)
+        all_labels = torch.cat(all_labels, dim=0)
+
+        unique_labels = torch.unique(all_labels)
+        prototypes = []
+        for c in unique_labels:
+            idx = torch.where(c == all_labels)[0]
+            class_features = all_features[idx]
+            class_prototype = class_features.mean(dim=0)
+            prototypes.append(class_prototype)
+        prototypes = torch.stack(prototypes, dim=0)
+        prototypes = F.normalize(prototypes, dim=-1)
+
+        result = (all_features, all_labels, prototypes)
+        if cache_key is not None:
+            self._cnn_support_cache[cache_key] = result
+        return result
+
+
+    def _project_cnn_prototypes(self, cnn_proto, clip_dim):
+        opts = self._cnn_opts()
+        key = (cnn_proto.shape[-1], clip_dim, opts.CNN_PROJECTION)
+        projection_matrix = self._cnn_projection_matrices.get(key)
+        projected, projection_matrix = project_cnn_features_to_clip(
+            cnn_proto,
+            clip_dim=clip_dim,
+            projection=opts.CNN_PROJECTION,
+            seed=0,
+            projection_matrix=projection_matrix,
+            return_matrix=True,
+        )
+        self._cnn_projection_matrices[key] = projection_matrix.detach()
+        return projected
+
+
+    def _apply_cnn_proto_adjustment(self, image_proto, cnn_proto):
+        lambda_cnn = self._cnn_opts().CNN_LAMBDA
+        cnn_projected = self._project_cnn_prototypes(cnn_proto, image_proto.shape[-1])
+        adjusted_proto = F.normalize(
+            (1 - lambda_cnn) * F.normalize(image_proto, dim=-1)
+            + lambda_cnn * cnn_projected,
+            dim=-1,
+        )
+
+        cosine_projected = (F.normalize(image_proto, dim=-1) * cnn_projected).sum(dim=-1)
+        cosine_adjusted = (F.normalize(image_proto, dim=-1) * adjusted_proto).sum(dim=-1)
+        delta_norm = (adjusted_proto - F.normalize(image_proto, dim=-1)).norm(dim=-1)
+        stats = {
+            "cnn_projected_cos_mean": float(cosine_projected.mean().item()),
+            "cnn_projected_cos_min": float(cosine_projected.min().item()),
+            "cnn_adjusted_cos_mean": float(cosine_adjusted.mean().item()),
+            "cnn_adjusted_delta_mean": float(delta_norm.mean().item()),
+            "cnn_adjusted_delta_max": float(delta_norm.max().item()),
+        }
+        print(
+            "CNN prototype adjustment stats: "
+            f"lambda={lambda_cnn:.4f}, "
+            f"projected_cos_mean={stats['cnn_projected_cos_mean']:.4f}, "
+            f"projected_cos_min={stats['cnn_projected_cos_min']:.4f}, "
+            f"adjusted_cos_mean={stats['cnn_adjusted_cos_mean']:.4f}, "
+            f"delta_mean={stats['cnn_adjusted_delta_mean']:.4f}, "
+            f"delta_max={stats['cnn_adjusted_delta_max']:.4f}"
+        )
+        return adjusted_proto, cnn_projected, stats
 
 
     @torch.no_grad()
@@ -185,6 +376,22 @@ class BiMC(nn.Module):
         else:
             self.base_vision_prototype = images_proto
 
+        cnn_features = None
+        cnn_targets = None
+        cnn_proto = None
+        cnn_projected_proto = None
+        cnn_adjustment_stats = None
+        cnn_mode = self._active_cnn_mode()
+        if self._cnn_enabled():
+            cnn_features, cnn_targets, cnn_proto = self.inference_all_cnn_feature(loader, cls_begin_index)
+            print(
+                "CNN support stats: "
+                f"mode={cnn_mode}, samples={cnn_features.shape[0]}, "
+                f"classes={cnn_proto.shape[0]}, feature_dim={cnn_features.shape[-1]}"
+            )
+            if cnn_uses_proto_adjust(cnn_mode):
+                images_proto, cnn_projected_proto, cnn_adjustment_stats = \
+                    self._apply_cnn_proto_adjustment(images_proto, cnn_proto)
 
         cov_images = torch.cov(images_features.T)
 
@@ -196,7 +403,7 @@ class BiMC(nn.Module):
         
         print('finish loading covariance')
 
-        return {
+        task_statistics = {
             'description_proto': description_proto,
             'description_features': description_features,
             'description_targets': description_targets,
@@ -212,6 +419,17 @@ class BiMC(nn.Module):
             'class_index': class_index,
             'sample_cnt': len(images_features)
         }
+        if self._cnn_enabled():
+            task_statistics.update({
+                'cnn_features': cnn_features,
+                'cnn_targets': cnn_targets,
+                'cnn_proto': cnn_proto,
+            })
+            if cnn_projected_proto is not None:
+                task_statistics['cnn_projected_proto'] = cnn_projected_proto
+            if cnn_adjustment_stats is not None:
+                task_statistics['cnn_adjustment_stats'] = cnn_adjustment_stats
+        return task_statistics
 
    
 
@@ -221,6 +439,7 @@ class BiMC(nn.Module):
                            description_features, description_targets,
                            text_features,
                            beta,
+                           cnn_proto=None,
                            return_beta_info=False):
     
         def knn_similarity_scores(queries, support_features, support_labels):
@@ -275,14 +494,43 @@ class BiMC(nn.Module):
 
         text_proto = self.calibrated_text_proto(text_features, description_proto)
         phase1_opts = self.cfg.TRAINER.BiMC
+        cnn_mode = self._active_cnn_mode()
         beta_info = {
             "mode": phase1_opts.FUSION_BETA_MODE,
             "geometry": phase1_opts.FUSION_GEOMETRY,
+            "cnn_mode": cnn_mode,
             "beta": None,
         }
 
         # Preserve the original BiMC formula exactly for the default baseline.
-        if phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
+        if cnn_uses_query_beta(cnn_mode):
+            if cnn_proto is None:
+                raise ValueError(f"CNN prototypes are required for {cnn_mode}.")
+            text_proto = F.normalize(text_proto, dim=-1)
+            image_proto = F.normalize(image_proto, dim=-1)
+            cnn_query_feat = self.extract_cnn_feature(images)
+            beta_x, cnn_beta_info = compute_cnn_query_reliability_beta(
+                query_clip_features=img_feat,
+                text_proto=text_proto,
+                query_cnn_features=cnn_query_feat,
+                cnn_proto=cnn_proto,
+                reliability_mode=phase1_opts.RELIABILITY_MODE,
+                beta_clip_min=phase1_opts.BETA_CLIP_MIN,
+                beta_clip_max=phase1_opts.BETA_CLIP_MAX,
+                cnn_topk=phase1_opts.CNN_TOPK,
+                return_info=True,
+            )
+            fused_proto = fuse_prototypes(
+                image_proto.unsqueeze(0),
+                text_proto.unsqueeze(0),
+                beta_x.view(-1, 1, 1),
+                geometry=phase1_opts.FUSION_GEOMETRY,
+            )
+            logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat, fused_proto)
+            beta_info["beta"] = beta_x.detach()
+            beta_info["cnn_reliability_text"] = cnn_beta_info["reliability_text"]
+            beta_info["cnn_reliability_visual"] = cnn_beta_info["reliability_visual"]
+        elif phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
             fused_proto = beta * text_proto + (1 - beta) * image_proto
             fused_proto = F.normalize(fused_proto, dim=-1)
             logits_proto_fused = img_feat @ fused_proto.t()
@@ -347,6 +595,29 @@ class BiMC(nn.Module):
         images = images.to(self.device)
         image_features = self.clip_model.encode_image(images)
         return image_features
+
+
+    def _cnn_preprocess_images(self, images):
+        clip_mean = torch.tensor(CLIP_IMAGE_MEAN, device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
+        clip_std = torch.tensor(CLIP_IMAGE_STD, device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
+        imagenet_mean = torch.tensor(IMAGENET_IMAGE_MEAN, device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
+        imagenet_std = torch.tensor(IMAGENET_IMAGE_STD, device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
+        images_01 = images * clip_std + clip_mean
+        images_01 = images_01.clamp(0, 1)
+        return (images_01 - imagenet_mean) / imagenet_std
+
+
+    @torch.no_grad()
+    def extract_cnn_feature(self, images):
+        if self.cnn_feature_extractor is None:
+            raise RuntimeError("CNN feature extractor is not initialized.")
+        images = images.to(self.device)
+        cnn_images = self._cnn_preprocess_images(images)
+        features = self.cnn_feature_extractor(cnn_images)
+        if isinstance(features, (tuple, list)):
+            features = features[0]
+        features = torch.flatten(features, start_dim=1)
+        return F.normalize(features, dim=-1)
 
 
     @torch.no_grad()

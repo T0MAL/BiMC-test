@@ -41,3 +41,32 @@ TRAINER:
     BETA_CLIP_MAX: 0.95
     RELIABILITY_MODE: "entropy_margin"
     SAVE_PHASE1_REPORT: True
+
+    PHASE2:
+      ENABLED: false
+
+      VISUAL_PROTO_MODE: "mean"
+      # allowed: "mean", "robust_weighted", "shrinkage_base_prior"
+
+      ROBUST_KAPPA: 16.0
+      ROBUST_DROP_LOWEST: false
+
+      SHRINKAGE_PRIOR: "base_neighbors"
+      # allowed: "base_neighbors", "text", "zero"
+
+      SHRINKAGE_EPS: 1e-8
+      SHRINKAGE_MIN: 0.0
+      SHRINKAGE_MAX: 1.0
+
+      DYNAMIC_LAMBDA_I: false
+      DYNAMIC_LAMBDA_MIN: 0.0
+      DYNAMIC_LAMBDA_MAX: 0.5
+
+      TEXT_PROTO_MODE: "mean"
+      # allowed: "mean", "discriminative_reweight", "visual_grounded_reweight", "combined_reweight", "topk_discriminative"
+
+      DESC_TEMP: 0.05
+      DESC_LAMBDA_D: 0.5
+      DESC_TOPK: 5
+
+      SAVE_PHASE2_REPORT: true

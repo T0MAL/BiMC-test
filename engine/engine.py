@@ -5,6 +5,7 @@ from tqdm import tqdm
 from utils.evaluator import AccuracyEvaluator
 from utils.phase1_fusion import beta_statistics, compute_class_margin_beta, validate_phase1_options
 from utils.phase1_report import write_phase1_outputs
+from utils.phase2_prototypes import validate_phase2_options
 from models.bimc import BiMC
 import numpy as np
 import time
@@ -15,6 +16,7 @@ class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
         validate_phase1_options(cfg)
+        validate_phase2_options(cfg)
         self.data_manager = DatasetManager(cfg,) 
         self.device = cfg.DEVICE.DEVICE_NAME
 
@@ -35,6 +37,7 @@ class Runner:
         self.eval_results = []
         self.beta_session_records = []
         self.beta_class_records = []
+        self.phase2_records = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
 
 
@@ -97,9 +100,11 @@ class Runner:
 
             current_state_dict = self._model_impl().build_task_statistics(current_class_name, loader,
                                                              class_index=self.data_manager.class_index_in_task[i], 
-                                                             calibrate_novel_vision_proto=self.cfg.TRAINER.BiMC.VISION_CALIBRATION,)
+                                                             calibrate_novel_vision_proto=self.cfg.TRAINER.BiMC.VISION_CALIBRATION,
+                                                             task_id=i,)
 
             state_dict_list.append(current_state_dict)            
+            self.phase2_records.extend(current_state_dict.get("phase2_records", []))
             merged_state_dict = self.merge_dicts(state_dict_list)
 
             start_time = time.time()
@@ -236,8 +241,9 @@ class Runner:
                 "session_metrics": self.eval_results,
                 "beta_session_records": self.beta_session_records,
                 "beta_class_records": self.beta_class_records,
+                "phase2_records": self.phase2_records,
             }
-        return write_phase1_outputs(
+        summary = write_phase1_outputs(
             cfg=self.cfg,
             dataset_name=self.data_manager.dataset_name,
             session_metrics=self.eval_results,
@@ -249,6 +255,8 @@ class Runner:
                 "Query-wise beta is computed per test batch from unlabeled query features only.",
             ],
         )
+        summary["phase2_records"] = self.phase2_records
+        return summary
     
 
     def parse_batch(self, batch):

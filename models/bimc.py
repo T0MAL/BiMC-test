@@ -4,6 +4,35 @@ import torch.nn.functional as F
 import models.clip.clip as clip
 import json
 from utils.phase1_fusion import compute_query_reliability_beta, fuse_prototypes
+from utils.phase2_prototypes import (
+    base_neighbor_prior,
+    combined_description_reweight,
+    compute_visual_quality,
+    discriminative_description_reweight,
+    dynamic_lambda_i_from_quality,
+    normalize as phase2_normalize,
+    robust_weighted_visual_prototype,
+    shrinkage_visual_prototype,
+    visual_grounded_description_reweight,
+)
+
+
+def _as_float(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().float().cpu().item())
+    return float(value)
+
+
+def _prefixed_stats(stats, prefix):
+    return {
+        f"{prefix}{key}": value
+        for key, value in stats.items()
+        if value is not None
+    }
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -43,6 +72,8 @@ class BiMC(nn.Module):
         self.text_proto = None
         self.description_proto = None
         self.vision_proto = None
+        self.base_vision_prototype = None
+        self.phase2_seen_text_features = None
 
 
     @torch.no_grad()
@@ -59,7 +90,7 @@ class BiMC(nn.Module):
             classname = classname.replace('_', ' ')
             classname = classname.replace('-', ' ')
             texts = [t.format(classname) for t in template]
-            texts = clip.tokenize(texts).cuda()
+            texts = clip.tokenize(texts).to(self.device)
             # prompt ensemble for ImageNet
             class_embeddings = self.clip_model.encode_text(texts)
             class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
@@ -102,21 +133,24 @@ class BiMC(nn.Module):
         description_embeddings = []
         mean_embeddings = []
         all_targets = []
-        file = open(gpt_path, "r")
-        GPT_prompt_dict = json.load(file)
+        with open(gpt_path, "r") as file:
+            GPT_prompt_dict = json.load(file)
         # The order of embeddings should follow strictly order of classname variable
         # Keys name should match classnames so that we could do fetching from the dict.
         # Convert the dict to lower case
         GPT_prompt_dict = {k.lower().replace("_", " "): v for k, v in GPT_prompt_dict.items()}
         k = cls_begin_index
         for single_key in class_names:
-            single_class_prompts = GPT_prompt_dict[single_key.lower().replace("_", " ")]
+            normalized_key = single_key.lower().replace("_", " ")
+            single_class_prompts = GPT_prompt_dict.get(normalized_key)
+            if not single_class_prompts:
+                single_class_prompts = [self.template[0].format(normalized_key.replace("-", " "))]
             targets = torch.full((len(single_class_prompts),), k)
 
             k += 1
             x_tokenized = torch.cat([clip.tokenize(p) for p in single_class_prompts])
             with torch.no_grad():
-                text_features = self.clip_model.encode_text(x_tokenized.cuda())
+                text_features = self.clip_model.encode_text(x_tokenized.to(self.device))
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             mean_embeddings.append(text_features.mean(0).unsqueeze(0))
             description_embeddings.append(text_features)
@@ -128,7 +162,16 @@ class BiMC(nn.Module):
         return description_embeddings, all_targets, mean_embeddings
 
 
-    def soft_calibration(self, base_protos, cur_protos):
+    def soft_calibration(
+        self,
+        base_protos,
+        cur_protos,
+        lambda_i=None,
+        class_ids=None,
+        session_id=None,
+        source="fixed",
+        return_records=False,
+    ):
         shift_weight = self.cfg.TRAINER.BiMC.LAMBDA_I
         tau = self.cfg.TRAINER.BiMC.TAU
         base_protos = F.normalize(base_protos, p=2, dim=-1)
@@ -137,8 +180,29 @@ class BiMC(nn.Module):
         norm_weights = torch.softmax(weights, dim=1)
         delta_protos = torch.matmul(norm_weights, base_protos)
         delta_protos = F.normalize(delta_protos, p=2, dim=-1)
-        updated_protos = (1 - shift_weight) * cur_protos + shift_weight * delta_protos
+        if lambda_i is None:
+            updated_protos = (1 - shift_weight) * cur_protos + shift_weight * delta_protos
+            lambda_values = torch.full(
+                (cur_protos.shape[0],),
+                float(shift_weight),
+                device=cur_protos.device,
+                dtype=cur_protos.dtype,
+            )
+        else:
+            lambda_values = lambda_i.to(device=cur_protos.device, dtype=cur_protos.dtype).reshape(-1)
+            updated_protos = (1 - lambda_values.unsqueeze(-1)) * cur_protos + lambda_values.unsqueeze(-1) * delta_protos
         updated_protos = F.normalize(updated_protos, dim=-1)
+        records = []
+        if class_ids is not None:
+            for row_id, class_id in enumerate(class_ids):
+                records.append({
+                    "session": int(session_id) if session_id is not None else None,
+                    "class_id": int(class_id),
+                    "lambda_i": _as_float(lambda_values[row_id]),
+                    "lambda_source": source,
+                })
+        if return_records:
+            return updated_protos, records
         return updated_protos
 
 
@@ -151,7 +215,7 @@ class BiMC(nn.Module):
     
 
     def build_task_statistics(self, class_names, loader,
-                         class_index, calibrate_novel_vision_proto=False):
+                         class_index, calibrate_novel_vision_proto=False, task_id=None):
         
             
         def shrink_cov(cov, alpha1=1.0, alpha2=0.0):
@@ -166,6 +230,9 @@ class BiMC(nn.Module):
 
 
         cls_begin_index = class_index[0]
+        session_id = int(task_id) if task_id is not None else self._session_id_from_class_index(class_index)
+        if cls_begin_index == 0:
+            self.phase2_seen_text_features = None
 
 
         text_features, text_targets = self.inference_text_feature(class_names, self.template, cls_begin_index)
@@ -177,11 +244,59 @@ class BiMC(nn.Module):
         
         images_features, images_targets, images_proto = \
                                     self.inference_all_img_feature(loader, cls_begin_index)
+        if self.phase2_seen_text_features is None:
+            all_class_name_protos = text_features
+        else:
+            all_class_name_protos = torch.cat([self.phase2_seen_text_features, text_features], dim=0)
+
+        images_proto, support_visual_proto, phase2_records, visual_quality = self._apply_phase2_visual_prototypes(
+            images_features=images_features,
+            images_targets=images_targets,
+            images_proto=images_proto,
+            text_features=text_features,
+            class_index=class_index,
+            session_id=session_id,
+        )
+
+        description_proto, text_records = self._apply_phase2_text_prototypes(
+            description_features=description_features,
+            description_targets=description_targets,
+            description_proto=description_proto,
+            text_features=text_features,
+            all_class_name_protos=all_class_name_protos,
+            support_visual_proto=support_visual_proto,
+            class_index=class_index,
+            session_id=session_id,
+        )
+        self._merge_phase2_records(phase2_records, text_records)
+        self.phase2_seen_text_features = all_class_name_protos.detach()
 
         if cls_begin_index != 0:
             if calibrate_novel_vision_proto:
                 print(f'calibrate vision proto on class [{class_index}]')
-                images_proto = self.soft_calibration(self.base_vision_prototype, images_proto)
+                lambda_i = None
+                lambda_source = "fixed"
+                p2_opts = self.cfg.TRAINER.BiMC.PHASE2
+                if p2_opts.ENABLED and p2_opts.DYNAMIC_LAMBDA_I:
+                    lambda_i = torch.stack([
+                        dynamic_lambda_i_from_quality(
+                            visual_quality[int(class_id)],
+                            min_val=p2_opts.DYNAMIC_LAMBDA_MIN,
+                            max_val=p2_opts.DYNAMIC_LAMBDA_MAX,
+                        )
+                        for class_id in class_index
+                    ])
+                    lambda_source = "dynamic_quality"
+                images_proto, calibration_records = self.soft_calibration(
+                    self.base_vision_prototype,
+                    images_proto,
+                    lambda_i=lambda_i,
+                    class_ids=class_index,
+                    session_id=session_id,
+                    source=lambda_source,
+                    return_records=True,
+                )
+                self._merge_phase2_records(phase2_records, calibration_records)
         else:
             self.base_vision_prototype = images_proto
 
@@ -208,10 +323,220 @@ class BiMC(nn.Module):
             'images_features': images_features,
             'images_targets': images_targets,
             'cov_image': cov_images,
+            'phase2_records': phase2_records,
             
             'class_index': class_index,
             'sample_cnt': len(images_features)
         }
+
+
+    def _apply_phase2_visual_prototypes(
+        self,
+        images_features,
+        images_targets,
+        images_proto,
+        text_features,
+        class_index,
+        session_id,
+    ):
+        p2_opts = self.cfg.TRAINER.BiMC.PHASE2
+        records = []
+        visual_quality = {}
+        mode = p2_opts.VISUAL_PROTO_MODE if p2_opts.ENABLED else "mean"
+        class_ids = [int(class_id) for class_id in class_index]
+
+        for rel_idx, class_id in enumerate(class_ids):
+            class_mask = images_targets == class_id
+            class_features = images_features[class_mask]
+            quality = compute_visual_quality(class_features)
+            visual_quality[class_id] = quality
+            records.append({
+                "session": int(session_id),
+                "class_id": class_id,
+                "visual_proto_mode": mode,
+                "visual_quality": _as_float(quality),
+                "visual_fallback": "",
+                "num_support": int(class_features.shape[0]),
+            })
+
+        if not p2_opts.ENABLED or mode == "mean":
+            return images_proto, images_proto, records, visual_quality
+
+        new_protos = []
+        for rel_idx, class_id in enumerate(class_ids):
+            record = records[rel_idx]
+            class_features = images_features[images_targets == class_id]
+            shot_proto = images_proto[rel_idx]
+            new_proto = shot_proto
+
+            if int(class_index[0]) == 0:
+                record["visual_fallback"] = "base_session_mean"
+
+            elif mode == "robust_weighted":
+                new_proto, _, stats = robust_weighted_visual_prototype(
+                    class_features,
+                    kappa=p2_opts.ROBUST_KAPPA,
+                    drop_lowest=p2_opts.ROBUST_DROP_LOWEST,
+                )
+                record.update(_prefixed_stats(stats, prefix="visual_"))
+
+            elif mode == "shrinkage_base_prior":
+                prior_proto, fallback = self._phase2_visual_prior(
+                    shot_proto=shot_proto,
+                    text_proto=text_features[rel_idx],
+                )
+                if fallback:
+                    record["visual_fallback"] = fallback
+                else:
+                    new_proto, rho, stats = shrinkage_visual_prototype(
+                        class_features,
+                        shot_proto,
+                        prior_proto,
+                        eps=p2_opts.SHRINKAGE_EPS,
+                        min_rho=p2_opts.SHRINKAGE_MIN,
+                        max_rho=p2_opts.SHRINKAGE_MAX,
+                    )
+                    record["shrinkage_rho"] = _as_float(rho)
+                    record.update(_prefixed_stats(stats, prefix="shrinkage_"))
+
+            new_protos.append(new_proto)
+
+        return torch.stack(new_protos, dim=0), torch.stack(new_protos, dim=0), records, visual_quality
+
+
+    def _phase2_visual_prior(self, shot_proto, text_proto):
+        p2_opts = self.cfg.TRAINER.BiMC.PHASE2
+        if p2_opts.SHRINKAGE_PRIOR == "base_neighbors":
+            if self.base_vision_prototype is None:
+                return shot_proto, "missing_base_prototypes"
+            return base_neighbor_prior(shot_proto, self.base_vision_prototype, tau=self.cfg.TRAINER.BiMC.TAU), ""
+        if p2_opts.SHRINKAGE_PRIOR == "text":
+            return phase2_normalize(text_proto, dim=-1), ""
+        if p2_opts.SHRINKAGE_PRIOR == "zero":
+            return torch.zeros_like(shot_proto), ""
+        return shot_proto, "invalid_prior"
+
+
+    def _apply_phase2_text_prototypes(
+        self,
+        description_features,
+        description_targets,
+        description_proto,
+        text_features,
+        all_class_name_protos,
+        support_visual_proto,
+        class_index,
+        session_id,
+    ):
+        p2_opts = self.cfg.TRAINER.BiMC.PHASE2
+        mode = p2_opts.TEXT_PROTO_MODE if p2_opts.ENABLED else "mean"
+        records = []
+
+        if not p2_opts.ENABLED or mode == "mean":
+            for rel_idx, class_id in enumerate(class_index):
+                desc = description_features[description_targets.to(description_features.device) == int(class_id)]
+                records.append(self._mean_description_record(desc, int(session_id), int(class_id), mode))
+            return description_proto, records
+
+        new_description_proto = []
+        targets = description_targets.to(description_features.device)
+        for rel_idx, class_id in enumerate(class_index):
+            class_id = int(class_id)
+            desc = description_features[targets == class_id]
+            record = {
+                "session": int(session_id),
+                "class_id": class_id,
+                "text_proto_mode": mode,
+                "text_fallback": "",
+                "num_descriptions": int(desc.shape[0]),
+            }
+
+            if desc.shape[0] == 0:
+                new_description_proto.append(description_proto[rel_idx])
+                record["text_fallback"] = "missing_descriptions"
+                records.append(record)
+                continue
+
+            if mode == "discriminative_reweight":
+                proto, _, stats = discriminative_description_reweight(
+                    desc,
+                    text_features[rel_idx],
+                    all_class_name_protos,
+                    temp=p2_opts.DESC_TEMP,
+                    topk=None,
+                )
+            elif mode == "visual_grounded_reweight":
+                proto, _, stats = visual_grounded_description_reweight(
+                    desc,
+                    support_visual_proto[rel_idx],
+                    temp=p2_opts.DESC_TEMP,
+                )
+            elif mode == "combined_reweight":
+                proto, _, stats = combined_description_reweight(
+                    desc,
+                    support_visual_proto[rel_idx],
+                    text_features[rel_idx],
+                    all_class_name_protos,
+                    temp=p2_opts.DESC_TEMP,
+                    lambda_d=p2_opts.DESC_LAMBDA_D,
+                )
+            elif mode == "topk_discriminative":
+                proto, _, stats = discriminative_description_reweight(
+                    desc,
+                    text_features[rel_idx],
+                    all_class_name_protos,
+                    temp=p2_opts.DESC_TEMP,
+                    topk=p2_opts.DESC_TOPK,
+                )
+            else:
+                proto = description_proto[rel_idx]
+                stats = {}
+                record["text_fallback"] = "invalid_text_mode"
+
+            new_description_proto.append(proto)
+            record.update(stats)
+            records.append(record)
+
+        return torch.stack(new_description_proto, dim=0), records
+
+
+    def _mean_description_record(self, desc, session_id, class_id, mode):
+        if desc.shape[0] == 0:
+            entropy = None
+        else:
+            entropy = float(torch.log(torch.tensor(float(desc.shape[0]))).item())
+        return {
+            "session": int(session_id),
+            "class_id": int(class_id),
+            "text_proto_mode": mode,
+            "text_fallback": "",
+            "num_descriptions": int(desc.shape[0]),
+            "desc_weight_entropy": entropy,
+            "desc_weight_min": float(1.0 / desc.shape[0]) if desc.shape[0] else None,
+            "desc_weight_max": float(1.0 / desc.shape[0]) if desc.shape[0] else None,
+        }
+
+
+    def _merge_phase2_records(self, target_records, incoming_records):
+        by_key = {
+            (record.get("session"), record.get("class_id")): record
+            for record in target_records
+        }
+        for record in incoming_records:
+            key = (record.get("session"), record.get("class_id"))
+            if key in by_key:
+                by_key[key].update(record)
+            else:
+                target_records.append(record)
+                by_key[key] = record
+
+
+    def _session_id_from_class_index(self, class_index):
+        first_class = int(class_index[0])
+        if first_class == 0:
+            return 0
+        inc = max(1, int(self.cfg.DATASET.NUM_INC_CLS))
+        return 1 + max(0, first_class - int(self.cfg.DATASET.NUM_INIT_CLS)) // inc
 
    
 

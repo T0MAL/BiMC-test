@@ -214,6 +214,7 @@ class BiMC(nn.Module):
                     mode=phase2_opts.VISUAL_PROTO_MODE,
                     shrinkage=phase2_opts.VISUAL_SHRINKAGE,
                     dynamic_lambda=phase2_opts.DYNAMIC_LAMBDA_I,
+                    dynamic_lambda_max=getattr(phase2_opts, "DYNAMIC_LAMBDA_MAX", 0.95),
                     tau=self.cfg.TRAINER.BiMC.TAU,
                 )
             elif calibrate_novel_vision_proto:
@@ -229,6 +230,8 @@ class BiMC(nn.Module):
             cov_images = shrink_cov(cov_images, alpha1=self.cfg.TRAINER.BiMC.GAMMA_BASE) 
         else:
             cov_images = shrink_cov(cov_images, alpha1=self.cfg.TRAINER.BiMC.GAMMA_INC)
+
+        cov_images_original = cov_images
 
         phase4_opts = self.cfg.TRAINER.BiMC.PHASE4
         if phase4_opts.ENABLED:
@@ -254,6 +257,7 @@ class BiMC(nn.Module):
             'images_features': images_features,
             'images_targets': images_targets,
             'cov_image': cov_images,
+            'cov_image_original': cov_images_original,
             
             'class_index': class_index,
             'sample_cnt': len(images_features)
@@ -269,6 +273,7 @@ class BiMC(nn.Module):
                            beta,
                            support_features=None,
                            support_labels=None,
+                           base_cov_image=None,
                            return_beta_info=False):
 
         def knn_similarity_scores(queries, support_features, support_labels):
@@ -454,6 +459,17 @@ class BiMC(nn.Module):
             ensemble_alpha = 1.0
 
         phase4_opts = self.cfg.TRAINER.BiMC.PHASE4
+        base_cov_probs = prob_cov
+        base_cov_logits_scaled = logits_cov_scaled
+        if phase4_opts.ENABLED and phase4_opts.APPLY_TO_NOVEL and base_cov_image is not None:
+            logits_cov_base = _cov_forward(img_feat, image_proto, base_cov_image)
+            base_cov_logits_scaled = apply_temperature(
+                logits_cov_base / 512,
+                enabled=phase3_opts.ENABLED and phase3_opts.TEMP_SCALING_ENABLED,
+                temperature=phase3_opts.TEMP_VALUE,
+            )
+            base_cov_probs = F.softmax(base_cov_logits_scaled, dim=-1)
+
         novel_aux_probs = prob_knn[:, NUM_BASE_CLS:]
         novel_aux_logits = logits_knn_scaled[:, NUM_BASE_CLS:]
         if phase4_opts.ENABLED and phase4_opts.APPLY_TO_NOVEL and prob_knn.shape[1] > NUM_BASE_CLS:
@@ -462,29 +478,46 @@ class BiMC(nn.Module):
                 prob_cov[:, NUM_BASE_CLS:],
                 replace_novel_nn=phase4_opts.REPLACE_NOVEL_NN,
                 combine_mode=phase4_opts.NOVEL_AUX_COMBINE_MODE,
+                cov_score_weight=getattr(phase4_opts, "COV_SCORE_WEIGHT", 0.5),
             )
             if phase4_opts.REPLACE_NOVEL_NN:
                 novel_aux_logits = logits_cov_scaled[:, NUM_BASE_CLS:]
             elif phase4_opts.NOVEL_AUX_COMBINE_MODE == "average":
                 novel_aux_logits = 0.5 * (logits_knn_scaled[:, NUM_BASE_CLS:] + logits_cov_scaled[:, NUM_BASE_CLS:])
+            elif phase4_opts.NOVEL_AUX_COMBINE_MODE in ("weighted", "reliability_gated"):
+                novel_aux_logits = torch.log(novel_aux_probs.clamp_min(1e-12))
 
-        aux_probs = torch.cat([prob_cov[:, :NUM_BASE_CLS], novel_aux_probs], dim=1)
-        aux_logits = torch.cat([logits_cov_scaled[:, :NUM_BASE_CLS], novel_aux_logits], dim=1)
+        aux_probs = torch.cat([base_cov_probs[:, :NUM_BASE_CLS], novel_aux_probs], dim=1)
+        aux_logits = torch.cat([base_cov_logits_scaled[:, :NUM_BASE_CLS], novel_aux_logits], dim=1)
 
+        base_alpha = ensemble_alpha
+        novel_alpha = ensemble_alpha
         if phase3_opts.ENABLED and phase3_opts.DYNAMIC_ALPHA_ENABLED:
-            alpha = compute_dynamic_alpha(
-                logits_proto_scaled,
-                aux_logits,
-                mode=phase3_opts.DYNAMIC_ALPHA_MODE,
-                alpha_clip_min=phase3_opts.ALPHA_CLIP_MIN,
-                alpha_clip_max=phase3_opts.ALPHA_CLIP_MAX,
-                energy_enabled=phase3_opts.ENERGY_ENABLED,
-            ).view(-1, 1)
-        else:
-            alpha = ensemble_alpha
+            dynamic_alpha_novel_only = getattr(phase3_opts, "DYNAMIC_ALPHA_NOVEL_ONLY", False)
+            has_novel = logits_proto_scaled.shape[1] > NUM_BASE_CLS
+            if dynamic_alpha_novel_only and has_novel:
+                novel_alpha = compute_dynamic_alpha(
+                    logits_proto_scaled[:, NUM_BASE_CLS:],
+                    aux_logits[:, NUM_BASE_CLS:],
+                    mode=phase3_opts.DYNAMIC_ALPHA_MODE,
+                    alpha_clip_min=phase3_opts.ALPHA_CLIP_MIN,
+                    alpha_clip_max=phase3_opts.ALPHA_CLIP_MAX,
+                    energy_enabled=phase3_opts.ENERGY_ENABLED,
+                ).view(-1, 1)
+            elif not dynamic_alpha_novel_only:
+                dynamic_alpha = compute_dynamic_alpha(
+                    logits_proto_scaled,
+                    aux_logits,
+                    mode=phase3_opts.DYNAMIC_ALPHA_MODE,
+                    alpha_clip_min=phase3_opts.ALPHA_CLIP_MIN,
+                    alpha_clip_max=phase3_opts.ALPHA_CLIP_MAX,
+                    energy_enabled=phase3_opts.ENERGY_ENABLED,
+                ).view(-1, 1)
+                base_alpha = dynamic_alpha
+                novel_alpha = dynamic_alpha
 
-        base_probs = alpha * prob_fused_proto[:, :NUM_BASE_CLS] + (1 - alpha) * aux_probs[:, :NUM_BASE_CLS]
-        inc_probs = alpha * prob_fused_proto[:, NUM_BASE_CLS:] + (1 - alpha) * aux_probs[:, NUM_BASE_CLS:]
+        base_probs = base_alpha * prob_fused_proto[:, :NUM_BASE_CLS] + (1 - base_alpha) * aux_probs[:, :NUM_BASE_CLS]
+        inc_probs = novel_alpha * prob_fused_proto[:, NUM_BASE_CLS:] + (1 - novel_alpha) * aux_probs[:, NUM_BASE_CLS:]
 
         prob_fused = torch.cat([base_probs, inc_probs], dim=1)
         if phase6_opts.ENABLED and phase6_opts.LABEL_PRIOR_ENABLED:

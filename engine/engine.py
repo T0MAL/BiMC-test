@@ -68,6 +68,8 @@ class Runner:
         cov_keys = [
             'cov_image',
         ]
+        if all('cov_image_original' in d for d in dict_list):
+            cov_keys.append('cov_image_original')
         cov_sums = {key: torch.zeros_like(dict_list[0][key]) for key in cov_keys}
         weight_sum = sum(weights)
 
@@ -154,6 +156,7 @@ class Runner:
                                                    beta=beta,
                                                    support_features=state_dict.get('images_features'),
                                                    support_labels=state_dict.get('images_targets'),
+                                                   base_cov_image=state_dict.get('cov_image_original'),
                                                    return_beta_info=True)
             if beta_info.get("beta") is not None:
                 beta_chunks.append(beta_info["beta"])

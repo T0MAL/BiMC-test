@@ -47,6 +47,7 @@ TRAINER:
       VISUAL_PROTO_MODE: "original"
       TEXT_PROTO_MODE: "original"
       DYNAMIC_LAMBDA_I: False
+      DYNAMIC_LAMBDA_MAX: 0.95
       VISUAL_SHRINKAGE: 0.1
       TEXT_REWEIGHT_TAU: 10.0
       TEXT_COMBINE_WEIGHT: 0.5
@@ -58,6 +59,7 @@ TRAINER:
       ENERGY_ENABLED: False
       DYNAMIC_ALPHA_ENABLED: False
       DYNAMIC_ALPHA_MODE: "entropy_margin"
+      DYNAMIC_ALPHA_NOVEL_ONLY: False
       ALPHA_CLIP_MIN: 0.05
       ALPHA_CLIP_MAX: 0.95
       HUBNESS_ENABLED: False
@@ -70,6 +72,7 @@ TRAINER:
       APPLY_TO_NOVEL: False
       REPLACE_NOVEL_NN: False
       NOVEL_AUX_COMBINE_MODE: "average"
+      COV_SCORE_WEIGHT: 0.5
       HYBRID_DIAG_WEIGHT: 0.5
       EPS: 1.0e-4
 

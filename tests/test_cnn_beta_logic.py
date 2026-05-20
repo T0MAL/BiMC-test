@@ -63,6 +63,27 @@ class CnnBetaLogicTests(unittest.TestCase):
         self.assertGreaterEqual(beta.min().item(), 0.05)
         self.assertLessEqual(beta.max().item(), 0.95)
 
+    def test_cnn_beta_accepts_mixed_clip_and_cnn_dtypes(self):
+        query_clip = F.normalize(torch.randn(3, 4, dtype=torch.float32), dim=-1)
+        text_proto = F.normalize(torch.randn(5, 4, dtype=torch.float64), dim=-1)
+        query_cnn = F.normalize(torch.randn(3, 6, dtype=torch.float32), dim=-1)
+        cnn_proto = F.normalize(torch.randn(5, 6, dtype=torch.float64), dim=-1)
+
+        beta = compute_cnn_query_reliability_beta(
+            query_clip,
+            text_proto,
+            query_cnn,
+            cnn_proto,
+            reliability_mode="entropy_margin",
+            beta_clip_min=0.05,
+            beta_clip_max=0.95,
+            cnn_topk=3,
+        )
+
+        self.assertEqual(beta.dtype, query_clip.dtype)
+        self.assertEqual(beta.shape, (3,))
+        self.assertTrue(torch.isfinite(beta).all())
+
 
 if __name__ == "__main__":
     unittest.main()

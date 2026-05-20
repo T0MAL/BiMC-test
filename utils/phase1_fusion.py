@@ -156,8 +156,14 @@ def compute_class_margin_beta(
 ):
     """Compute one beta value per class from support-set text/visual margins."""
     support_features = F.normalize(support_features, dim=-1)
-    text_proto = F.normalize(text_proto, dim=-1)
-    visual_proto = F.normalize(visual_proto, dim=-1)
+    text_proto = F.normalize(text_proto, dim=-1).to(
+        device=support_features.device,
+        dtype=support_features.dtype,
+    )
+    visual_proto = F.normalize(visual_proto, dim=-1).to(
+        device=support_features.device,
+        dtype=support_features.dtype,
+    )
     support_labels = support_labels.to(device=support_features.device).long()
 
     num_classes = text_proto.shape[0]
@@ -257,8 +263,14 @@ def compute_query_reliability_beta(
 ):
     """Compute one beta value per query from unlabeled text/visual reliability."""
     query_features = F.normalize(query_features, dim=-1)
-    text_proto = F.normalize(text_proto, dim=-1)
-    visual_proto = F.normalize(visual_proto, dim=-1)
+    text_proto = F.normalize(text_proto, dim=-1).to(
+        device=query_features.device,
+        dtype=query_features.dtype,
+    )
+    visual_proto = F.normalize(visual_proto, dim=-1).to(
+        device=query_features.device,
+        dtype=query_features.dtype,
+    )
 
     scores_text = query_features @ text_proto.t()
     scores_visual = query_features @ visual_proto.t()
@@ -360,9 +372,15 @@ def compute_cnn_query_reliability_beta(
 ):
     """Compute query-wise beta from CLIP text reliability and CNN visual reliability."""
     query_clip_features = F.normalize(query_clip_features, dim=-1)
-    text_proto = F.normalize(text_proto, dim=-1)
     query_cnn_features = F.normalize(query_cnn_features, dim=-1)
-    cnn_proto = F.normalize(cnn_proto, dim=-1)
+    text_proto = F.normalize(text_proto, dim=-1).to(
+        device=query_clip_features.device,
+        dtype=query_clip_features.dtype,
+    )
+    cnn_proto = F.normalize(cnn_proto, dim=-1).to(
+        device=query_cnn_features.device,
+        dtype=query_cnn_features.dtype,
+    )
 
     scores_text = query_clip_features @ text_proto.t()
     scores_cnn = query_cnn_features @ cnn_proto.t()

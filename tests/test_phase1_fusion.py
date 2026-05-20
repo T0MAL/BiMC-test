@@ -82,6 +82,35 @@ class Phase1FusionTests(unittest.TestCase):
         self.assertGreaterEqual(beta.min().item(), 0.05)
         self.assertLessEqual(beta.max().item(), 0.95)
 
+    def test_reliability_helpers_accept_mixed_proto_dtypes(self):
+        support_features = F.normalize(torch.randn(6, 8, dtype=torch.float32), dim=-1)
+        support_labels = torch.tensor([0, 0, 1, 1, 2, 2])
+        text_proto = F.normalize(torch.randn(3, 8, dtype=torch.float32), dim=-1)
+        visual_proto = F.normalize(torch.randn(3, 8, dtype=torch.float64), dim=-1)
+
+        class_beta = compute_class_margin_beta(
+            support_features,
+            support_labels,
+            text_proto,
+            visual_proto,
+            beta_temperature=0.05,
+            beta_clip_min=0.05,
+            beta_clip_max=0.95,
+        )
+        query_beta = compute_query_reliability_beta(
+            support_features,
+            text_proto,
+            visual_proto,
+            reliability_mode="entropy_margin",
+            beta_clip_min=0.05,
+            beta_clip_max=0.95,
+        )
+
+        self.assertEqual(class_beta.dtype, support_features.dtype)
+        self.assertEqual(query_beta.dtype, support_features.dtype)
+        self.assertTrue(torch.isfinite(class_beta).all())
+        self.assertTrue(torch.isfinite(query_beta).all())
+
 
 if __name__ == "__main__":
     unittest.main()

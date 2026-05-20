@@ -159,9 +159,9 @@ class BiMC(nn.Module):
         print(f'class names: {class_names}')
         clip_weights = []
         all_targets = []
-        k = cls_begin_index
+        k = int(cls_begin_index)
         for classname in class_names:
-            targets = torch.full((len(template),), k)
+            targets = torch.full((len(template),), k, dtype=torch.long)
             all_targets.append(targets)
             k += 1
             # Tokenize the prompts
@@ -299,10 +299,10 @@ class BiMC(nn.Module):
         # Keys name should match classnames so that we could do fetching from the dict.
         # Convert the dict to lower case
         GPT_prompt_dict = {k.lower().replace("_", " "): v for k, v in GPT_prompt_dict.items()}
-        k = cls_begin_index
+        k = int(cls_begin_index)
         for single_key in class_names:
             single_class_prompts = GPT_prompt_dict[single_key.lower().replace("_", " ")]
-            targets = torch.full((len(single_class_prompts),), k)
+            targets = torch.full((len(single_class_prompts),), k, dtype=torch.long)
 
             k += 1
             x_tokenized = torch.cat([clip.tokenize(p) for p in single_class_prompts])
@@ -449,13 +449,18 @@ class BiMC(nn.Module):
             """
             # Ensure all inputs are on the same device
             device = queries.device
-            support_features = support_features.to(device)
-            support_labels = support_labels.to(device)
+            support_features = support_features.to(device=device, dtype=queries.dtype)
+            support_labels = support_labels.to(device=device, dtype=torch.long)
             similarity_scores = torch.matmul(queries, support_features.T)
-            k = torch.max(support_labels) + 1
-            max_scores = torch.full((queries.size(0), k), float('-inf'), device=device)
+            num_support_classes = int(torch.max(support_labels).item()) + 1
+            max_scores = torch.full(
+                (queries.size(0), num_support_classes),
+                float('-inf'),
+                device=device,
+                dtype=queries.dtype,
+            )
             expanded_labels = support_labels.unsqueeze(0).expand(queries.size(0), -1)
-            for label in range(k):
+            for label in range(num_support_classes):
                 label_mask = (expanded_labels == label)
                 masked_scores = similarity_scores.masked_fill(~label_mask, float('-inf'))
                 max_scores[:, label] = torch.max(masked_scores, dim=1).values
@@ -486,6 +491,13 @@ class BiMC(nn.Module):
             maha_dist = torch.stack(maha_dist)
             logits = -maha_dist.T
             return logits
+
+
+        def _prototype_logits(features, prototypes):
+            prototypes = prototypes.to(device=features.device, dtype=features.dtype)
+            if prototypes.ndim == 3:
+                return torch.einsum("bd,bcd->bc", features, prototypes)
+            return features @ prototypes.t()
         
 
         # Normalize the image features
@@ -526,14 +538,14 @@ class BiMC(nn.Module):
                 beta_x.view(-1, 1, 1),
                 geometry=phase1_opts.FUSION_GEOMETRY,
             )
-            logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat, fused_proto)
+            logits_proto_fused = _prototype_logits(img_feat, fused_proto)
             beta_info["beta"] = beta_x.detach()
             beta_info["cnn_reliability_text"] = cnn_beta_info["reliability_text"]
             beta_info["cnn_reliability_visual"] = cnn_beta_info["reliability_visual"]
         elif phase1_opts.FUSION_BETA_MODE == "fixed" and phase1_opts.FUSION_GEOMETRY == "linear":
             fused_proto = beta * text_proto + (1 - beta) * image_proto
             fused_proto = F.normalize(fused_proto, dim=-1)
-            logits_proto_fused = img_feat @ fused_proto.t()
+            logits_proto_fused = _prototype_logits(img_feat, fused_proto)
         else:
             text_proto = F.normalize(text_proto, dim=-1)
             image_proto = F.normalize(image_proto, dim=-1)
@@ -553,7 +565,7 @@ class BiMC(nn.Module):
                     beta_x.view(-1, 1, 1),
                     geometry=phase1_opts.FUSION_GEOMETRY,
                 )
-                logits_proto_fused = torch.einsum("bd,bcd->bc", img_feat, fused_proto)
+                logits_proto_fused = _prototype_logits(img_feat, fused_proto)
                 beta_info["beta"] = beta_x.detach()
             else:
                 fused_proto = fuse_prototypes(
@@ -562,7 +574,7 @@ class BiMC(nn.Module):
                     beta,
                     geometry=phase1_opts.FUSION_GEOMETRY,
                 )
-                logits_proto_fused = img_feat @ fused_proto.t()
+                logits_proto_fused = _prototype_logits(img_feat, fused_proto)
                 if isinstance(beta, torch.Tensor):
                     beta_info["beta"] = beta.detach()
         prob_fused_proto = F.softmax(logits_proto_fused, dim=-1)
